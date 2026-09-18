@@ -36,12 +36,6 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
 
-// Weak fallbacks for HOST .so builds (never called, but satisfy the linker).
-// AICPU builds link strong platform clock and device-configuration symbols.
-// Hidden visibility prevents HOST .so from polluting global symbol table.
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-__attribute__((weak, visibility("hidden"))) int get_tensor_data_timeout_ms() { return 0; }
-
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================

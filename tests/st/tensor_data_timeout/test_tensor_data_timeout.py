@@ -9,6 +9,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Exercise timeout transport and initialization latching through real Workers."""
 
+import os
+import re
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +34,8 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 HERE = Path(__file__).parent
 RUNTIME = "tensormap_and_ringbuffer"
 ENV = "SIMPLER_TENSOR_DATA_TIMEOUT_MS"
+PRODUCER_SLEEP_MS = 1000
+_TIMEOUT_RE = re.compile(r"failed with code -8\b")
 
 
 def _build_callable(platform):
@@ -51,24 +56,39 @@ def _build_callable(platform):
     )
 
 
-def _run(worker, handle, expect_timeout):
+def _run(worker, handle, expect_timeout, *, device_id=None, budget_ms=None, label=""):
     host = torch.zeros(1, dtype=torch.int32)
     buffer = worker.malloc(host.nbytes)
     try:
         worker.copy_to(buffer, host)
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(1,), dtype=DataType.INT32), TensorArgType.OUTPUT_EXISTING)
-        args.add_scalar(1000)
+        args.add_scalar(PRODUCER_SLEEP_MS)
         config = CallConfig()
         # Scalar waits require the scheduler to run on a separate thread.
         config.aicpu_thread_num = 2
-        if expect_timeout:
-            with pytest.raises(RuntimeError, match=r"failed with code -8\b"):
-                worker.run(handle, args, config)
-        else:
+        t0 = time.perf_counter()
+        raised = None
+        try:
             worker.run(handle, args, config)
-            worker.copy_from(host, buffer)
-            assert host.item() == 7
+        except BaseException as exc:  # noqa: BLE001 — surface any outcome in diagnostics
+            raised = exc
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        detail = (
+            f"{label} device_id={device_id} budget_ms={budget_ms} "
+            f"env[{ENV}]={os.environ.get(ENV)!r} producer_sleep_ms={PRODUCER_SLEEP_MS} "
+            f"wall_ms={wall_ms:.1f} raised={raised!r}"
+        )
+        if expect_timeout:
+            if raised is None:
+                pytest.fail(f"expected code -8 timeout but run succeeded; {detail}")
+            if not isinstance(raised, RuntimeError) or _TIMEOUT_RE.search(str(raised)) is None:
+                pytest.fail(f"expected code -8 timeout but got unexpected error; {detail}")
+            return
+        if raised is not None:
+            raise raised
+        worker.copy_from(host, buffer)
+        assert host.item() == 7, detail
     finally:
         worker.free(buffer)
 
@@ -98,9 +118,24 @@ def _exercise_latched_timeout(st_platform, st_device_ids, monkeypatch, initial, 
         handle = worker.register(_build_callable(st_platform))
         worker.init()
         monkeypatch.setenv(ENV, "3000" if initial == "250" else "250")
-        _run(worker, handle, initial == "250")
+        device_id = int(st_device_ids[0])
+        _run(
+            worker,
+            handle,
+            initial == "250",
+            device_id=device_id,
+            budget_ms=initial,
+            label=f"latched[initial={initial!r}]",
+        )
         if initial != "250":
-            _run(worker, handle, False)
+            _run(
+                worker,
+                handle,
+                False,
+                device_id=device_id,
+                budget_ms=initial,
+                label=f"latched-success[initial={initial!r}]",
+            )
     finally:
         worker.close()
 
@@ -113,15 +148,30 @@ def test_tensor_timeout_is_isolated_between_workers(st_platform, st_device_ids, 
     chip_callable = _build_callable(st_platform)
     workers = []
     handles = []
+    budgets = ["3000", "250"]
     try:
-        for device_id, budget in zip(st_device_ids, ["3000", "250"], strict=True):
+        for device_id, budget in zip(st_device_ids, budgets, strict=True):
             monkeypatch.setenv(ENV, budget)
             worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(device_id))
             workers.append(worker)
             handles.append(worker.register(chip_callable))
             worker.init()
-        _run(workers[0], handles[0], False)
-        _run(workers[1], handles[1], True)
+        _run(
+            workers[0],
+            handles[0],
+            False,
+            device_id=int(st_device_ids[0]),
+            budget_ms=budgets[0],
+            label="isolated workers[0]",
+        )
+        _run(
+            workers[1],
+            handles[1],
+            True,
+            device_id=int(st_device_ids[1]),
+            budget_ms=budgets[1],
+            label="isolated workers[1]",
+        )
     finally:
         for worker in reversed(workers):
             worker.close()
