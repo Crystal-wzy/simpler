@@ -74,7 +74,9 @@ extern "C" {
  *
  * Consumer paths:
  *       - AICPU: receives this KernelArgs directly via rtsLaunchCpuKernel
- *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
+ *       - AICore: receives `AicoreLaunchArgs` via KERNEL_ENTRY, a projection of
+ *         this struct carrying the subset its entry reads. It never reads this
+ *         struct itself.
  */
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
@@ -87,6 +89,11 @@ struct KernelArgs {
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // chip swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t chip_swimlane_data_base{0};
+    // This run's chip-swimlane terminal-snapshot bank, resolved by the host from
+    // the run's pipeline slot. 0 whenever the host resolved no bank, including
+    // every run with swimlane off; the device treats 0 as "publish no snapshot"
+    // and never derives an address of its own.
+    uint64_t chip_swimlane_run_terminal_bank{0};
     uint64_t pmu_data_base{0};      // PMU buffer base address (device memory); 0 = PMU disabled
     uint64_t dep_gen_data_base{0};  // dep_gen shared memory base address; use explicit flags to detect enablement
     // Profiling per-core address arrays (moved out of Handshake). Each *_addrs
@@ -103,6 +110,19 @@ struct KernelArgs {
     // See the a2a3 kernel_args.h for the full design rationale (CANN's
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
+
+    // Device pointer to this run's result region (DeviceRunResultRegion), and
+    // the run epoch its device side publishes into that region. Same reason the
+    // wall base travels here rather than inline: AICPU gets KernelArgs as a
+    // CANN-private copy, so an inline field would be write-only from AICPU.
+    //
+    // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
+    // result has to survive whether or not timing capture is on. The host does
+    // not clear the region per run; the epoch is what makes a previous run's
+    // payload recognisable as stale, so arming costs no H2D.
+    // Both zero when no region was allocated.
+    uint64_t run_result_data_base{0};
+    uint64_t run_result_epoch{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
@@ -115,6 +135,66 @@ struct KernelArgs {
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
+
+// The swimlane bases are not offset-locked by any device contract — AICPU reads
+// them by field name from a CANN-private copy of the whole struct. These pin the
+// measured a5 layout so that appending, reordering, or widening a field is a
+// build failure rather than a silently different launch payload: `sizeof` is
+// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
+// what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The values
+// differ from a2a3's: this struct has no `ffts_base_addr` and carries two
+// trailing uint32_t rather than one.
+static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
+static_assert(
+    offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
+    "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
+);
+static_assert(sizeof(KernelArgs) == 112, "KernelArgs launch-payload size drift");
+static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
+// No conditional members: the struct body carries no preprocessor branch, so
+// these values are the same in every translation unit that sees this header.
+static_assert(__is_trivially_copyable(KernelArgs), "KernelArgs must be memcpy-able to the device");
+static_assert(__is_standard_layout(KernelArgs), "KernelArgs must be standard-layout");
+
+/**
+ * AicoreLaunchArgs - the AICore entry's launch argument block.
+ *
+ * Mirrors `KERNEL_ENTRY(aicore_kernel)`'s parameter list field for field: ccec
+ * demotes a struct parameter to a hidden pointer, so the entry takes a flat
+ * scalar list and this is the host-side image of it. Changing either without
+ * the other silently mis-decodes the block.
+ *
+ * Every address an AICore entry needs is here, so the entry publishes its
+ * per-core state from these values alone and reads no GM to do it. The driver
+ * copies the block during the launch call, so the host builds it after
+ * collector arming and these are this run's final values. `force_simt_anchor`
+ * stays a launch argument so its value is opaque to the optimizer where the
+ * never-taken SIMT branch is emitted.
+ */
+struct AicoreLaunchArgs {
+    uint64_t runtime_args;
+    uint32_t enable_profiling_flag;
+    uint32_t force_simt_anchor;
+    uint64_t chip_swimlane_aicore_rotation_table;
+    uint64_t aicore_pmu_ring_addrs;
+    // `KernelArgs::regs`, which the entry indexes by physical core id to resolve
+    // this core's PMU MMIO base. The AICPU reads the same table for its own
+    // dispatch windows.
+    uint64_t pmu_reg_addrs;
+};
+
+static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+
+/**
+ * Fill the fields of `AicoreLaunchArgs` that only this architecture has, so the
+ * shared launch path can build the block without knowing which arch it is on.
+ */
+inline void fill_arch_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
+    args.force_simt_anchor = k_args.force_simt_anchor;
+    args.chip_swimlane_aicore_rotation_table = k_args.chip_swimlane_aicore_rotation_table;
+    args.aicore_pmu_ring_addrs = k_args.aicore_pmu_ring_addrs;
+    args.pmu_reg_addrs = k_args.regs;
+}
 
 /**
  * InitArgs - per-device runtime configuration

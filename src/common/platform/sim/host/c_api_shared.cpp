@@ -92,7 +92,23 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+/**
+ * Perform the device write a run's bind prepared.
+ *
+ * The bind computes its device execution image into staging that outlives it and
+ * records where the bytes go; this ships them. Two steps rather than one, so the
+ * write can be ordered against something — or captured and replayed — without
+ * the host graph building that produced the bytes having to run again. Consumes
+ * the record: publishing twice, or publishing a bind that recorded nothing, is an
+ * error, because a run whose image never reached the device must not launch. A
+ * runtime whose bind writes its own image where it builds it implements this as a
+ * no-op.
+ */
+int publish_run_image_impl(Runtime *runtime, const HostApi *api);
+/** @see the onboard c_api_shared.cpp declarations for the three halves' contract. */
+int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 
 /* ===========================================================================
  * Context-bound HostApi functions passed to runtime implementations.
@@ -215,6 +231,18 @@ acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t
     try {
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)
             ->acquire_sm_mirror(pipeline_slot, bytes, alignment, addr_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int
+acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_run_image_staging(pipeline_slot, bytes, alignment, addr_out);
     } catch (...) {
         return -1;
     }
@@ -348,6 +376,7 @@ static const HostApiOps g_host_api_ops = {
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,
+    .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
@@ -359,6 +388,10 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    // The simulated AICPU runs in this process and shares the runtime's
+    // address space, so a run's result never has to leave a device: nothing
+    // allocates a result region and nothing publishes into one.
+    .get_run_result = nullptr,
 };
 
 /* ===========================================================================
@@ -504,7 +537,7 @@ int simpler_init(
     // runtimes link the weak no-op. Only the ring sizing is read.
     if (prewarm_config != NULL) {
         try {
-            const HostApi prewarm_api(runner, 0, 0, &g_host_api_ops);
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
                 prewarm_config->runtime_env.ring_dep_pool
@@ -536,7 +569,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
                 runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
             }
         });
-        const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+        const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
         int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
         if (rc != 0) {
             return rc;
@@ -694,15 +727,17 @@ static void emit_native_run_runner_wall(SimNativeRunContext *state) {
     state->runner_trace_start_ns = 0;
 }
 
-static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc, bool clear_gm_sm) {
+static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
-    if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
     state->runner->finish_clock_correlation_session(state->descriptor.pipeline_slot, false);
+    // A prepare that failed produced no device work, so there is no status to
+    // read and nothing written to copy back. Whatever bindings its bind got as
+    // far as recording are this attempt's, and end with it.
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
+        validation_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -772,10 +807,10 @@ int simpler_prepare_run(
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         rc = runner->prepare_launch_shape(state->runtime, state->config);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         runner->apply_call_config(state->config);
         // This run's host-phase state, before its bind records into it.
@@ -792,16 +827,41 @@ int simpler_prepare_run(
                 state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The bind prepared this run's device image into staging the slot owns;
+        // this publishes it, before anything else touches the device arena. Two
+        // calls rather than one because the write is orderable on its own: the
+        // bytes are ready when the bind returns, and shipping them is this
+        // caller's decision.
+        {
+            STRACE("chip.run.publish_image");
+            rc = publish_run_image_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
         emit_host_dep_gen_graph(state->config, state->trace_attrs);
-        rc = runner->prepare_execution(
-            state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
-            &state->prepared_execution
-        );
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        // This run's own input bytes, into the buffers its bind just named.
+        {
+            STRACE("chip.run.stage_inputs");
+            rc = copy_in_run_inputs_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
+        {
+            STRACE("chip.run.prepare_execution");
+            rc = runner->prepare_execution(
+                state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
+                &state->prepared_execution
+            );
+        }
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
         return 0;
     } catch (...) {
-        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL, true);
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
@@ -932,13 +992,17 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        if (!launched) state->runtime.set_gm_sm_ptr(nullptr);
         if (attach_rc == 0) {
             {
                 STRACE("chip.run.validate");
-                validation_rc = validate_runtime_impl(
-                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL
+                validation_rc = copy_back_run_outputs_impl(
+                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                    launched ? 1 : 0
                 );
+                // This run is the only user of its bindings, so they end here,
+                // after its outputs have come back through them.
+                const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0) emit_device_phase_markers(state->runner);
         } else {

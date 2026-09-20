@@ -13,6 +13,7 @@
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
+#include "device_fault_monitor_host.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
 
@@ -74,6 +75,26 @@ void bind_host_log_state(void *handle, const char *module_name) {
     if (simpler::log::bind_loaded_host_log_state(handle, HostLogger::get_instance().state(), &error) != 0) {
         throw std::runtime_error(
             std::string(module_name) + " failed to bind host-log state: " + (error != nullptr ? error : "unknown error")
+        );
+    }
+}
+
+/**
+ * Hand the loaded module the process's device-fault monitor.
+ *
+ * The monitor and the trampoline the driver retains live in this module, which
+ * the interpreter never unloads; a host runtime is opened `RTLD_LOCAL` and
+ * `dlclose`d, so it can only hold a pointer. Binding is mandatory rather than
+ * best-effort for the same reason the host-log binding is: every module built
+ * from this source tree exports the setter, so a missing one means a stale
+ * build, and a silently unbound runtime would report no device fault at all.
+ */
+void bind_device_fault_monitor(void *handle, const char *module_name) {
+    const char *error = nullptr;
+    if (bind_loaded_device_fault_monitor(handle, &error) != 0) {
+        throw std::runtime_error(
+            std::string(module_name) +
+            " failed to bind the device-fault monitor: " + (error != nullptr ? error : "unknown error")
         );
     }
 }
@@ -208,6 +229,7 @@ void ChipWorker::init(
     }
     DlHandleGuard host_guard(handle);
     bind_host_log_state(handle, "host runtime");
+    bind_device_fault_monitor(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
     KernelSupportedFn kernel_supported_fn = nullptr;
@@ -233,6 +255,11 @@ void ChipWorker::init(
         poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
         wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
         finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
+        // Absent on every simulated and stand-in module by construction, so a
+        // null here is a fact about the backend rather than a stale build. The
+        // caller reports it.
+        probe_run_retention_fn_ =
+            reinterpret_cast<SimplerProbeRunRetentionFn>(dlsym(handle, "simpler_probe_run_retention"));
         supports_concurrent_native_prepare_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
         get_arena_bank_gm_heap_base_fn_ =
@@ -386,6 +413,7 @@ void ChipWorker::init(
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
+        probe_run_retention_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
@@ -448,6 +476,7 @@ void ChipWorker::init(
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
+        probe_run_retention_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
@@ -557,6 +586,7 @@ void ChipWorker::finalize() {
     poll_run_fn_ = nullptr;
     wait_run_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
+    probe_run_retention_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
@@ -941,6 +971,65 @@ void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
             "finalize_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
         );
     }
+}
+
+RunRetentionProbeReport ChipWorker::probe_run_retention(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &successor, const RunRetentionProbeConfig &config
+) {
+    if (probe_run_retention_fn_ == nullptr) {
+        throw std::runtime_error(
+            "this runtime module exports no run-retention fixture; it measures a stream-level property and only "
+            "onboard modules carry it"
+        );
+    }
+    const bool want_successor = config.launch_successor != 0;
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        if (run.slot_id >= runtime_bufs_.size()) {
+            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+        }
+        const NativeRunSlotState &state = native_run_states_[run.slot_id];
+        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::LAUNCHED) {
+            throw std::runtime_error(
+                "probe_run_retention needs a launched, undrained predecessor " + format_native_run_identity(run)
+            );
+        }
+        if (want_successor) {
+            if (successor.slot_id >= runtime_bufs_.size() || successor.slot_id == run.slot_id) {
+                throw std::runtime_error("probe_run_retention needs the successor on a different pipeline slot");
+            }
+            const NativeRunSlotState &next = native_run_states_[successor.slot_id];
+            if (next.run_epoch != successor.run_epoch || next.phase != NativeRunPhase::PREPARED) {
+                throw std::runtime_error(
+                    "probe_run_retention needs a prepared, unlaunched successor " +
+                    format_native_run_identity(successor)
+                );
+            }
+        }
+    }
+
+    RunRetentionProbeReport report{};
+    const int rc = probe_run_retention_fn_(
+        device_ctx_, runtime_bufs_[run.slot_id].data(),
+        want_successor ? runtime_bufs_[successor.slot_id].data() : nullptr, &config, &report
+    );
+    if (rc != 0) {
+        throw std::runtime_error(
+            "probe_run_retention refused its arguments with code " + std::to_string(rc) + " " +
+            format_native_run_identity(run)
+        );
+    }
+    if (want_successor) {
+        // The fixture drained the successor, so it is where an ordinary wait
+        // would have left it. The predecessor stays LAUNCHED on purpose: its
+        // drain, copy-back and DFX teardown are the production path, and
+        // finalize reaches all three from that phase.
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        NativeRunSlotState &next = native_run_states_[successor.slot_id];
+        next.wait_rc = report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc;
+        next.phase = NativeRunPhase::REAPED;
+    }
+    return report;
 }
 
 void ChipWorker::cleanup_native_runs_noexcept() noexcept {

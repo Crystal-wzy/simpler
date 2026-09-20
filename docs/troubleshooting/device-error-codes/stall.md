@@ -33,8 +33,10 @@ The `sub_class=` line gives you `stuck_task_id` and `stuck_core`. Map the task i
 back to your orchestration and look at that kernel for an infinite loop, a wait on
 a signal that never arrives, or simply too much work.
 
-When the task id is not enough, lower the log threshold to **DEBUG** and the device log
-prints a task snapshot at the moment of the stall:
+When the task id is not enough, the device log carries a per-task snapshot of the
+moment the scheduler gave up. It follows the `[SHUTDOWN_SNAPSHOT … reason=scheduler_timeout]`
+line and is printed at **the default log threshold**, so a stall that was already
+reaped can be read without reproducing it:
 
 ```text
 [STALL thread=0 idle_iterations=...] TASK ring=1 task_id=42 state=RUNNING \
@@ -44,7 +46,13 @@ prints a task snapshot at the moment of the stall:
 
 `kernels=[...]` are the kernel ids in the task's three sub-core slots and
 `cores=[...]` the physical cores running it — that maps "stuck task" to "which
-kernel, on which core".
+kernel, on which core". The `SUMMARY` line beside them gives `completed=x/y` and the
+iteration progress last happened on.
+
+Lowering the threshold to **DEBUG** adds the *periodic* rounds the scheduler emits
+every `STALL_LOG_INTERVAL` idle iterations while a stall is still building. Those
+rounds are what show whether the pending set was changing or frozen from the start —
+the shutdown snapshot alone shows only the final state.
 
 Setting the level:
 

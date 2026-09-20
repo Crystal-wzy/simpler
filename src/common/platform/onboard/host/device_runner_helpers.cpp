@@ -77,75 +77,64 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
     return query_stream_error(aicore_stream, "AICore");
 }
 
-int KernelArgsHelper::init_runtime_args(
+int KernelArgsHelper::prepare_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
 ) {
+    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
+    release_run_view();
     allocator_ = &allocator;
 
-    // Only the device-read prefix of Runtime crosses to the device: trb copies
-    // its `dev` descriptor (offset 0), hbg copies the whole object. Both start
-    // at &host_runtime; runtime_device_copy_size() picks the right length per
-    // runtime variant so this shared path stays runtime-agnostic.
-    const uint64_t runtime_size = runtime_device_copy_size(host_runtime);
+    // Both runtime variants publish the descriptor at offset zero. Host-only
+    // orchestration state and tensor leases remain outside this snapshot, and so
+    // does any device-initialized tail the descriptor ends in: the block is sized
+    // to the whole descriptor because the device addresses that range inside it,
+    // while only the uploaded prefix is snapshotted and copied.
+    const uint64_t runtime_extent = runtime_device_extent_size(host_runtime);
     // The length is a property of the runtime variant, which is fixed for a
     // runner, so a committed block always fits. A mismatch would mean the
     // block belongs to a different variant than the run being prepared.
-    if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_size) {
+    if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_extent) {
         LOG_ERROR(
             "runtime_args block is %llu bytes but this run needs %llu",
-            static_cast<unsigned long long>(slot.runtime_bytes), static_cast<unsigned long long>(runtime_size)
+            static_cast<unsigned long long>(slot.runtime_bytes), static_cast<unsigned long long>(runtime_extent)
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (slot.runtime_args == nullptr) {
-        void *runtime_dev = allocator_->alloc(runtime_size);
+        void *runtime_dev = allocator_->alloc(runtime_extent);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
-        slot.runtime_bytes = runtime_size;
+        slot.runtime_bytes = runtime_extent;
     }
+    runtime_image_.prepare(host_runtime);
     args.runtime_args = slot.runtime_args;
-    int rc = rtMemcpy(args.runtime_args, runtime_size, &host_runtime, runtime_size, RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for runtime failed: %d", rc);
-        args.runtime_args = nullptr;
-        return rc;
-    }
+    runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
 }
 
-int KernelArgsHelper::init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot) {
-    allocator_ = &allocator;
-    if (slot.device_k_args == nullptr) {
-        void *dev_ptr = allocator_->alloc(sizeof(KernelArgs));
-        if (dev_ptr == nullptr) {
-            LOG_ERROR("Alloc for device KernelArgs failed");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        slot.device_k_args = reinterpret_cast<KernelArgs *>(dev_ptr);
-    }
-    device_k_args_ = slot.device_k_args;
-    int rc = rtMemcpy(device_k_args_, sizeof(KernelArgs), &args, sizeof(KernelArgs), RT_MEMCPY_HOST_TO_DEVICE);
+int KernelArgsHelper::publish_runtime_args() {
+    if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (args.runtime_args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    // The consumed snapshot is neither pending nor published during the copy.
+    // Reentrant publish is rejected; copy failure leaves fresh prepare admissible.
+    runtime_args_state_ = RuntimeArgsState::Empty;
+    const int rc = runtime_image_.publish([this](const void *source, size_t bytes) {
+        return rtMemcpy(args.runtime_args, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
+    });
     if (rc != 0) {
-        LOG_ERROR("rtMemcpy for KernelArgs failed: %d", rc);
-        device_k_args_ = nullptr;
-        return rc;
+        LOG_ERROR("runtime metadata publication failed: %d", rc);
+        args.runtime_args = nullptr;
+    } else {
+        runtime_args_state_ = RuntimeArgsState::Published;
     }
-    return 0;
+    return rc;
 }
 
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
     int first_error = 0;
-    if (slot.device_k_args != nullptr) {
-        const int rc = allocator.free(slot.device_k_args);
-        if (rc != 0) {
-            first_error = rc;
-        } else {
-            slot.device_k_args = nullptr;
-        }
-    }
     if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
         if (rc != 0) {
@@ -159,7 +148,6 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
 }
 
 void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
-    slot.device_k_args = nullptr;
     slot.runtime_args = nullptr;
     slot.runtime_bytes = 0;
 }

@@ -178,10 +178,17 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym("set_platform_run_result", reinterpret_cast<void **>(&set_platform_run_result_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
                 "set_platform_chip_swimlane_base", reinterpret_cast<void **>(&set_platform_chip_swimlane_base_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
+                "set_platform_chip_swimlane_run_terminal_bank",
+                reinterpret_cast<void **>(&set_platform_chip_swimlane_run_terminal_bank_func_)
             ))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym(
@@ -376,16 +383,6 @@ int DeviceRunner::prepare_execution(
     // The profiling flag is built by `arm_collectors_for_run` at launch, beside
     // the collector pools it describes.
 
-    for (int i = 0; i < runtime.get_task_count(); i++) {
-        Task *task = runtime.get_task(i);
-        if (task != nullptr) {
-            uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
-            const CoreCallable *c = reinterpret_cast<const CoreCallable *>(callable_addr);
-            task->function_bin_addr = c->resolved_addr();
-            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
-        }
-    }
-
     rc = prepare_orch_so(runtime);
     if (rc != 0) {
         LOG_ERROR("prepare_orch_so failed: %d", rc);
@@ -440,11 +437,12 @@ int DeviceRunner::prepare_execution(
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
-        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
-        set_platform_pmu_reg_addrs_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
-        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
-        set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_run_result_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
@@ -490,6 +488,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_platform_dump_base_func_(kernel_args_.dump_data_base);
                 set_dump_args_enabled_func_(prepared->dfx.dump_args_enabled());
                 set_platform_chip_swimlane_base_func_(kernel_args_.chip_swimlane_data_base);
+                set_platform_chip_swimlane_run_terminal_bank_func_(kernel_args_.chip_swimlane_run_terminal_bank);
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
@@ -516,6 +515,11 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 }
                 reset_device_phase_buffer(&run->phase_buf, over_launch);
                 set_platform_phase_base_func_(reinterpret_cast<uint64_t>(&run->phase_buf));
+                // Sim allocates no result region, so there is no base to publish —
+                // but the epoch still has to reach the AICPU SO, because the
+                // collectors stamp it onto every buffer they acquire. Without
+                // it sim records carry no run identity at all.
+                set_platform_run_result_func_(/*region_base=*/0, prepared->identity.run_epoch);
                 sim_t0 = std::chrono::steady_clock::now();
                 run_completion_.reset(static_cast<size_t>(over_launch) + static_cast<size_t>(num_aicore));
             } catch (...) {
@@ -527,33 +531,39 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             for (int i = 0; i < num_aicore; i++) {
                 CoreType core_type = runtime.get_workers()[i].core_type;
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
-                run->aicore_threads.push_back(create_thread([this, run, i, core_type, physical_core_id]() {
-                    aicore_execute_func_(
-                        run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
-                        kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
-                    );
-                    run_completion_.task_finished();
-                }));
+                run->aicore_threads.push_back(create_thread(
+                    [this, run, i, core_type, physical_core_id]() {
+                        aicore_execute_func_(
+                            run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
+                            kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table
+                        );
+                        run_completion_.task_finished();
+                    },
+                    std::string("sim-") + (core_type == CoreType::AIC ? "aic" : "aiv") + "-" + std::to_string(i)
+                ));
             }
             return 0;
         },
         [&](LaunchProgressSink &) -> int {
             LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
             for (int i = 0; i < over_launch; i++) {
-                run->aicpu_threads.push_back(create_thread([this, run, launch_aicpu_num, over_launch, sim_t0]() {
-                    if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
-                        run_completion_.task_finished();
-                        return;
-                    }
-                    int rc = aicpu_execute_func_(run->runtime);
-                    if (kernel_args_.device_wall_data_base != 0) {
-                        const auto t1 = std::chrono::steady_clock::now();
-                        *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
-                        );
-                    }
-                    run_completion_.task_finished(rc);
-                }));
+                run->aicpu_threads.push_back(create_thread(
+                    [this, run, launch_aicpu_num, over_launch, sim_t0]() {
+                        if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
+                            run_completion_.task_finished();
+                            return;
+                        }
+                        int rc = aicpu_execute_func_(run->runtime);
+                        if (kernel_args_.device_wall_data_base != 0) {
+                            const auto t1 = std::chrono::steady_clock::now();
+                            *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
+                            );
+                        }
+                        run_completion_.task_finished(rc);
+                    },
+                    "sim-aicpu-" + std::to_string(i)
+                ));
             }
             return 0;
         }
@@ -634,12 +644,16 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         // them: a failed run is the one whose swimlane, dumped tensors and
         // dep_gen graph are worth reading. `false` withholds only the
         // DeviceExecutionComplete clock anchor, which this run never reached.
-        teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, false);
+        teardown_shared_collectors_after_run(
+            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, false
+        );
         emit_device_dep_gen_graph(dfx);
         return runtime_rc;
     }
 
-    teardown_shared_collectors_after_run(dfx, active.prepared->pipeline_slot, true);
+    teardown_shared_collectors_after_run(
+        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, true
+    );
     emit_device_dep_gen_graph(dfx);
 
     print_handshake_results();
@@ -670,8 +684,20 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
     // that failed mid-flight yields a whole graph or none — never a partial one.
     if (!dep_gen_collector_.reconcile_counters()) return;
     const std::string deps = make_deps_json_path(dfx.output_prefix);
-    const auto &records = dep_gen_collector_.records();
-    int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    // One deps.json describes one graph. A window with no records still gets a
+    // file — an empty graph is this run's answer, and suppressing it would make
+    // "nothing submitted" indistinguishable from "collection failed". Several
+    // runs in one window is the only case that cannot be emitted, because the
+    // path would have to name which run; that belongs with session output.
+    uint64_t dep_gen_run_epoch = 0;
+    const std::vector<DepGenRecord> *records = dep_gen_collector_.window_records(&dep_gen_run_epoch);
+    if (records == nullptr) {
+        LOG_ERROR(
+            "dep_gen collected %zu runs in one window — deps.json not produced", dep_gen_collector_.runs().size()
+        );
+        return;
+    }
+    int rc = dep_gen_replay_emit_deps_json(records->data(), records->size(), deps.c_str());
     if (rc != 0) {
         LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
     }
@@ -693,6 +719,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_chip_swimlane_base_func_ = nullptr;
+        set_platform_chip_swimlane_run_terminal_bank_func_ = nullptr;
         set_platform_chip_swimlane_aicore_rotation_table_func_ = nullptr;
         set_chip_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
@@ -736,6 +763,7 @@ int DeviceRunner::finalize() {
     unload_executor_binaries();
     release_graph_definition_blocks();
     release_sm_mirrors();
+    release_run_image_stagings();
 
     // Release the three per-Worker pooled arenas. Must precede mem_alloc_.finalize()
     // so the arenas free through the still-live allocator, not after it.
@@ -786,7 +814,7 @@ int DeviceRunner::finalize() {
 // Performance Profiling Implementation
 // =============================================================================
 
-int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -808,6 +836,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. `kernel_args_` is a runner member that outlives the run,
+    // so the reset is load-bearing here, not defensive.
+    kernel_args_.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc = init_chip_swimlane(num_aicore, aicpu_thread_num, device_id_, dfx.chip_swimlane_level);
@@ -823,6 +856,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
             core_types[i] = runtime.get_workers()[i].core_type;
         }
         chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        kernel_args_.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {
@@ -908,7 +946,7 @@ int DeviceRunner::init_chip_swimlane(
     return 0;
 }
 
-int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
+int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {

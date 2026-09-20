@@ -33,10 +33,14 @@ int PersistentKernelArgs::prepare_once(const Runtime &host_runtime, const Persis
     }
     ops_ = ops;
 
-    // Only the device-read prefix of Runtime crosses to the device: trb copies
-    // its `dev` descriptor (offset 0), hbg copies the whole object.
+    // Both runtimes copy only the device-read descriptor at offset zero;
+    // host-only state stays outside this allocation. The allocation covers the
+    // whole descriptor and the copy carries its uploaded prefix: where a variant
+    // ends its descriptor in device-initialized storage the two differ, and the
+    // device addresses that range inside this block.
+    const size_t runtime_extent = runtime_device_extent_size(host_runtime);
     const size_t runtime_bytes = runtime_device_copy_size(host_runtime);
-    void *runtime_dev = ops_.alloc(ops_.context, runtime_bytes);
+    void *runtime_dev = ops_.alloc(ops_.context, runtime_extent);
     if (runtime_dev == nullptr) {
         LOG_ERROR("PersistentKernelArgs::prepare_once: alloc for runtime_args failed");
         return PTO_RUNTIME_ERR_INTERNAL;

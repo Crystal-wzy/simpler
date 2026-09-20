@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -130,6 +132,25 @@ public:
     uint32_t last_producer_queue() const { return last_producer_queue_.load(std::memory_order_relaxed); }
     int last_shard() const { return last_shard_.load(std::memory_order_relaxed); }
 
+    void init_shadow(void *device, void *host) {
+        this->set_aicpu_thread_num(1);
+        auto copy = [](void *dst, const void *src, size_t size) {
+            std::memcpy(dst, src, size);
+            return 0;
+        };
+        this->set_memory_context(
+            [](size_t size) {
+                return std::calloc(1, size);
+            },
+            nullptr,
+            [](void *ptr) {
+                std::free(ptr);
+                return 0;
+            },
+            copy, copy, device, host, sizeof(TestHeader), 0
+        );
+    }
+
     // Stand-in for a real Derived::init(): latch the thread count and hand the
     // base an identity-mapped (SVM-style) memory context.
     void
@@ -176,6 +197,101 @@ bool wait_for_collected(const Collector &c, int expected, std::chrono::milliseco
 }
 
 }  // namespace
+
+TEST(ProfilerBaseTest, ReinitializedContextIsAvailableBeforeStart) {
+    TestHeader previous{};
+    TestHeader current{};
+    TestCollector<PerThreadModule> collector;
+    collector.init(1, &previous);
+    collector.start(nullptr);
+    collector.stop();
+    collector.init(1, &current);
+    EXPECT_EQ(collector.manager().shared_mem_host(), &current);
+    EXPECT_EQ(collector.manager().shared_mem_dev(), &current);
+}
+
+TEST(ProfilerBaseTest, ReusedShadowWritesToTheCurrentDeviceRegionBeforeStart) {
+    TestHeader previous_device{};
+    TestHeader current_device{};
+    TestHeader reused_shadow{};
+    TestCollector<PerThreadModule> collector;
+    collector.init_shadow(&previous_device, &reused_shadow);
+    collector.start(nullptr);
+    collector.stop();
+    collector.init_shadow(&current_device, &reused_shadow);
+    reused_shadow.queue_heads[0] = 7;
+    ASSERT_EQ(collector.manager().write_range_to_device(&reused_shadow.queue_heads[0], sizeof(uint32_t)), 0);
+    EXPECT_EQ(previous_device.queue_heads[0], 0u);
+    EXPECT_EQ(current_device.queue_heads[0], 7u);
+    collector.manager().release_all_owned([](void *ptr) {
+        std::free(ptr);
+    });
+}
+
+TEST(ProfilerBaseTest, RebuiltShadowUsesNewOffsetBeforeStart) {
+    TestHeader device{};
+    // Reproduce the host-base displacement captured in the A5 #2220 failure
+    // while keeping the device allocation unchanged.
+    alignas(TestHeader) unsigned char storage[sizeof(TestHeader) + 352]{};
+    auto *previous_shadow = new (storage + 352) TestHeader{};
+    TestCollector<PerThreadModule> collector;
+    collector.init_shadow(&device, previous_shadow);
+    collector.start(nullptr);
+    collector.stop();
+    previous_shadow->~TestHeader();
+    auto *current_shadow = new (storage) TestHeader{};
+    collector.init_shadow(&device, current_shadow);
+    current_shadow->queue_heads[0] = 7;
+    ASSERT_EQ(collector.manager().write_range_to_device(&current_shadow->queue_heads[0], sizeof(uint32_t)), 0);
+    EXPECT_EQ(device.queue_heads[0], 7u);
+    collector.manager().release_all_owned([](void *ptr) {
+        std::free(ptr);
+    });
+    current_shadow->~TestHeader();
+}
+
+TEST(ProfilerBaseTest, IncompleteReinitializationCannotUsePreviousContext) {
+    TestHeader device{};
+    TestHeader shadow{};
+    TestCollector<PerThreadModule> collector;
+    collector.init_shadow(&device, &shadow);
+    collector.start(nullptr);
+    collector.stop();
+    collector.manager().release_all_owned([](void *ptr) {
+        std::free(ptr);
+    });
+
+    // Real collectors first publish null bases while allocating a new region.
+    // If allocation fails, no successful context publication or start follows.
+    collector.init_shadow(nullptr, nullptr);
+    EXPECT_EQ(collector.manager().shared_mem_host(), nullptr);
+    EXPECT_EQ(collector.manager().shared_mem_dev(), nullptr);
+    int spawned = 0;
+    collector.start([&](std::function<void()> fn) {
+        ++spawned;
+        return std::thread(std::move(fn));
+    });
+    EXPECT_EQ(spawned, 0);
+    collector.stop();
+}
+
+TEST(ProfilerBaseTest, ClearedContextCannotWriteToPreviousDevice) {
+    TestHeader device{};
+    TestHeader shadow{};
+    TestCollector<PerThreadModule> collector;
+    collector.init_shadow(&device, &shadow);
+    collector.start(nullptr);
+    collector.stop();
+    collector.manager().release_all_owned([](void *ptr) {
+        std::free(ptr);
+    });
+    collector.clear_memory_context();
+    shadow.queue_heads[0] = 7;
+    collector.manager().write_range_to_device(&shadow.queue_heads[0], sizeof(uint32_t));
+    EXPECT_EQ(device.queue_heads[0], 0u);
+    EXPECT_EQ(collector.manager().shared_mem_host(), nullptr);
+    EXPECT_EQ(collector.manager().shared_mem_dev(), nullptr);
+}
 
 // One drain+collector pair per AICPU thread when the module allows it.
 TEST(ProfilerBaseTest, ShardCountFollowsAicpuThreadNum) {
@@ -533,4 +649,298 @@ TEST(ProfilerBaseTest, QuiesceIsANoOpWithoutRunningThreads) {
 
     collector.quiesce();  // after stop()
     EXPECT_EQ(collector.collected(), 0);
+}
+
+// A device-side publication that the manager rejects must say so. Discarding the
+// result -- which every collector call site used to do -- configures nothing and
+// reports nothing: the device keeps its previous value, and the only trace is the
+// manager's own log line, which names neither the subsystem nor the field. That
+// is how a disagreement between a collector's shm pointer and the manager's copy
+// reaches a reader as "no records were produced" (#2206).
+//
+// The manager is configured directly rather than through init(): publish_field
+// consults only the manager, and the shared fixture's init() leaves
+// copy_to_device null, which makes write_range_to_device succeed trivially.
+namespace {
+
+// A window carved out of the middle of a larger object, so the out-of-window
+// addresses these tests hand to publish_field are still inside one allocation.
+// Stepping off `&header` instead would be pointer arithmetic outside the object:
+// undefined, so UBSan flags it and an optimizer may assume it cannot happen --
+// which would quietly delete the very boundary this file is testing.
+struct PublishWindow {
+    static constexpr size_t kPad = 128;
+
+    TestHeader *header() { return reinterpret_cast<TestHeader *>(backing + kPad); }
+    // Inside the backing object, `n` bytes below the window's base.
+    const char *below(size_t n) { return backing + kPad - n; }
+    // Inside the backing object, at the window's first byte past the end.
+    const char *past_end() { return backing + kPad + sizeof(TestHeader); }
+
+    alignas(64) char backing[kPad + sizeof(TestHeader) + kPad] = {};
+};
+
+void bind_publish_window(TestCollector<SingleShardModule> &collector, PublishWindow &window, int *copies) {
+    profiling_common::MemoryOps ops{};
+    ops.alloc = [](size_t size) {
+        return std::malloc(size);
+    };
+    ops.copy_to_device = [copies](void *, const void *, size_t) {
+        ++*copies;
+        return 0;
+    };
+    collector.manager().set_memory_context(
+        std::move(ops), window.header(), window.header(), sizeof(TestHeader), /*device_id=*/0
+    );
+}
+
+}  // namespace
+
+TEST(ProfilerBaseTest, PublishFieldPushesAFieldInsideTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    TestHeader *header = window.header();
+    EXPECT_TRUE(collector.publish_field(&header->queue_heads[0], sizeof(header->queue_heads[0]), "queue_heads[0]"));
+    EXPECT_EQ(copies, 1);
+}
+
+TEST(ProfilerBaseTest, PublishFieldReportsAFieldBelowTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    // One cache line below the base: the shape seen in the field, where the
+    // rejected writes sat 64 bytes under the manager's window.
+    EXPECT_FALSE(collector.publish_field(window.below(64), sizeof(uint32_t), "queue_heads[0]"));
+    EXPECT_EQ(copies, 0) << "a rejected field must not reach copy_to_device";
+}
+
+TEST(ProfilerBaseTest, PublishFieldReportsAFieldStraddlingTheWindowEnd) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    // Starts inside, runs off the end. Rejected whole rather than truncated: a
+    // partial push would leave the device holding half of a value.
+    EXPECT_FALSE(collector.publish_field(window.past_end() - sizeof(uint32_t), 2 * sizeof(uint32_t), "counters"));
+    EXPECT_EQ(copies, 0);
+}
+
+// A size larger than the whole window must be rejected without the bounds
+// arithmetic wrapping.
+TEST(ProfilerBaseTest, PublishFieldReportsASizeLargerThanTheWindow) {
+    PublishWindow window;
+    int copies = 0;
+    TestCollector<SingleShardModule> collector;
+    bind_publish_window(collector, window, &copies);
+
+    EXPECT_FALSE(collector.publish_field(window.header(), sizeof(TestHeader) + 1, "whole header"));
+    EXPECT_EQ(copies, 0);
+}
+
+// A buffer this manager never mapped cannot be delivered however often it is
+// retried, so the drain path retires it: the queue keeps draining, the loss is
+// counted, and the buffer goes back into the free_queue. Before the entry was
+// acknowledged only after delivery, the same entry was acknowledged first and
+// then dropped by a bare return — the records vanished with nothing counting
+// them and the buffer left the pool for good.
+TEST(ProfilerBaseTest, UnmappableBufferIsRetiredCountedAndReturnedToThePool) {
+    TestHeader header{};
+    uint64_t unmapped = 0;
+    uint64_t mapped = 0;
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header);
+    register_buffer(collector, &mapped);
+    collector.start(nullptr);
+    // start() tops the free_queue up to kSlotCount, so model the two pops AICPU
+    // makes before publishing the two entries below. Without the room a retired
+    // buffer can only go to the manager's retired pool, which is the fallback
+    // rather than the behaviour under test.
+    header.free_queue.head = 2;
+
+    publish(header, 1, &unmapped);
+    publish(header, 1, &mapped);
+    ASSERT_TRUE(wait_for_collected(collector, 1, std::chrono::seconds(5)));
+    collector.quiesce();
+
+    EXPECT_EQ(collector.collected(), 1);               // the mapped one only
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);  // and the loss is named
+    EXPECT_EQ(header.queue_heads[1], 2u);              // neither entry blocks the queue
+
+    bool returned_to_pool = false;
+    for (uint32_t slot = 0; slot < kSlotCount; slot++) {
+        if (header.free_queue.buffer_ptrs[slot] == reinterpret_cast<uint64_t>(&unmapped)) {
+            returned_to_pool = true;
+        }
+    }
+    EXPECT_TRUE(returned_to_pool);
+
+    collector.stop();
+}
+
+// A failing device→host copy is the transport failing, not the entry being
+// unreadable, so the entry keeps its place at the queue head: nothing is
+// acknowledged and nothing is counted while the copy can still succeed. The
+// record then survives a transient failure instead of being dropped by the
+// first attempt at it.
+TEST(ProfilerBaseTest, FailedBufferCopyLeavesTheEntryUnacknowledged) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    std::atomic<bool> copy_buffer_fails{true};
+    std::atomic<int> buffer_copy_attempts{0};
+
+    // Only the buffer payload copy fails; the header range reads the drain loop
+    // needs to see the queue at all must keep working.
+    auto copy = [&](void *dst, const void *src, size_t size) {
+        if (src == &buffer) {
+            buffer_copy_attempts.fetch_add(1, std::memory_order_relaxed);
+            if (copy_buffer_fails.load(std::memory_order_relaxed)) return -1;
+        }
+        std::memcpy(dst, src, size);
+        return 0;
+    };
+
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header, copy);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    // A second attempt is the observable proof that the entry survived the first
+    // failure. Bounded, because "the entry was consumed and never retried" — the
+    // behaviour this test exists to catch — would otherwise hang it rather than
+    // fail it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (buffer_copy_attempts.load(std::memory_order_relaxed) < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(buffer_copy_attempts.load(std::memory_order_relaxed), 2);
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(header.queue_heads[1], 0u);              // still the device's slot
+    EXPECT_EQ(collector.drain_dropped_buffers(), 0u);  // nothing given up on yet
+
+    // Recovering the transport delivers the record the drain path held on to.
+    copy_buffer_fails.store(false, std::memory_order_relaxed);
+    collector.quiesce();
+    EXPECT_EQ(collector.collected(), 1);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 0u);
+
+    collector.stop();
+}
+
+// The retry above must be bounded: a copy that never recovers would otherwise
+// hold the queue head forever and quiesce() — which waits for every drain shard
+// to report its queues empty — could never return.
+TEST(ProfilerBaseTest, PermanentlyFailingCopyIsRetiredSoQuiesceCompletes) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    auto copy = [&](void *dst, const void *src, size_t size) {
+        if (src == &buffer) return -1;
+        std::memcpy(dst, src, size);
+        return 0;
+    };
+
+    TestCollector<SingleShardModule> collector;
+    collector.init(2, &header, copy);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    collector.quiesce();
+
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+
+    collector.stop();
+}
+
+namespace {
+
+// An entry whose indices do not validate: resolve_entry rejects it, so the
+// drain path never learns its kind or its originating free_queue and cannot
+// hand the buffer back the way the other retire paths do.
+struct RejectingModule : TestModuleBase<1> {
+    static std::optional<profiling_common::EntrySite<RejectingModule>>
+    resolve_entry(void * /*shm*/, DataHeader * /*header*/, int /*q*/, const ReadyEntry & /*entry*/) {
+        return std::nullopt;
+    }
+
+    template <typename Cb>
+    static void for_each_instance(void * /*shm*/, DataHeader *header, Cb &&cb) {
+        cb(0, &header->free_queue, sizeof(uint64_t));
+    }
+};
+
+// Pointers teardown hands to the collector's release callback. Recorded, never
+// freed: these tests point at stack storage on purpose.
+template <typename Collector>
+std::vector<void *> released_at_teardown(Collector &collector) {
+    std::vector<void *> released;
+    collector.manager().release_owned_buffers([&released](void *ptr) {
+        released.push_back(ptr);
+    });
+    return released;
+}
+
+}  // namespace
+
+// A rejected entry's buffer pointer arrived in the same corrupt entry, so it
+// must never reach a device-visible free_queue — but when the manager can map it
+// to a block it owns it is still this collector's buffer, and dropping it on the
+// floor loses it from the pool for the rest of the run. It goes to the retired
+// pool, which teardown releases.
+TEST(ProfilerBaseTest, UnresolvableEntryParksAnOwnedBufferForTeardown) {
+    TestHeader header{};
+    uint64_t buffer = 0;
+    TestCollector<RejectingModule> collector;
+    collector.init(2, &header);
+    register_buffer(collector, &buffer);
+    collector.start(nullptr);
+
+    publish(header, 1, &buffer);
+    collector.quiesce();
+    collector.stop();
+
+    EXPECT_EQ(collector.collected(), 0);
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);  // the queue still drains
+    // Not republished to the device: AICPU must never be handed a pointer that
+    // came out of an entry whose own indices were wrong.
+    for (uint32_t slot = 0; slot < kSlotCount; slot++) {
+        EXPECT_NE(header.free_queue.buffer_ptrs[slot], reinterpret_cast<uint64_t>(&buffer));
+    }
+
+    const std::vector<void *> released = released_at_teardown(collector);
+    EXPECT_NE(std::find(released.begin(), released.end(), &buffer), released.end());
+}
+
+// The same rejection, but the pointer maps to nothing this manager owns — the
+// expected shape when the entry is truly corrupt. Parking it would make
+// teardown call the release callback on it, because release_pointer_for()
+// returns an unmapped pointer unchanged, so a wild pointer would be freed.
+// Withholding it is the only safe outcome.
+TEST(ProfilerBaseTest, UnresolvableEntryWithholdsAnUnownedBufferFromTeardown) {
+    TestHeader header{};
+    uint64_t foreign = 0;
+    TestCollector<RejectingModule> collector;
+    collector.init(2, &header);
+    // Deliberately not registered: resolve_host_ptr cannot vouch for it.
+    collector.start(nullptr);
+
+    publish(header, 1, &foreign);
+    collector.quiesce();
+    collector.stop();
+
+    EXPECT_EQ(collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(header.queue_heads[1], 1u);
+
+    const std::vector<void *> released = released_at_teardown(collector);
+    EXPECT_EQ(std::find(released.begin(), released.end(), &foreign), released.end());
 }

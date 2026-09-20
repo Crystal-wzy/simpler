@@ -114,10 +114,11 @@ int ChipSwimlaneCollector::initialize(
     const ChipSwimlaneFreeCallback &free_cb
 ) {
     if (shm_host_ != nullptr) {
-        // Already holding this run's device resources. They are not per-run:
-        // configuration arrives via begin_run() and the layout is fixed at
-        // compile time, so there is nothing here left to re-apply.
-        return 0;
+        // Already holding this run's device resources. They are not per-run,
+        // with one exception: the level decides whether a device orch-phase
+        // pool exists, and begin_run() re-publishes the level every run, so a
+        // run may ask for a level the pools were not built for.
+        return ensure_device_orch_pool(chip_swimlane_level);
     }
     chip_swimlane_level_ = chip_swimlane_level;
     if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
@@ -503,6 +504,59 @@ size_t ChipSwimlaneCollector::normalize_collector_shard(int collector_shard) con
     return static_cast<size_t>(collector_shard);
 }
 
+int ChipSwimlaneCollector::ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level) {
+    if (shm_host_ == nullptr) return 0;
+    if (chip_swimlane_level < ChipSwimlaneLevel::ORCH_PHASES || host_orchestrated_) return 0;
+
+    // Device-orchestrated level 4 uses one orch instance (pool 0). A non-zero
+    // tail is the host's own seeding mark, and nothing lowers it, so it reads
+    // "an earlier run already built this pool".
+    ChipSwimlaneAicpuTaskPool *state = get_orch_phase_buffer_state(shm_host_, 0);
+    if (state->free_queue.tail != 0) return 0;
+
+    constexpr size_t buffer_bytes = sizeof(ChipSwimlaneAicpuOrchPhaseBuffer);
+    constexpr int initial_free_count = (PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD < PLATFORM_PROF_SLOT_COUNT) ?
+                                           PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD :
+                                           PLATFORM_PROF_SLOT_COUNT;
+    // The surplus goes to the lane the orch pool's drain shard owns, matching
+    // where initialize() puts it when it builds this pool up front.
+    const int shard = (aicpu_thread_num_ > 0) ? (aicpu_thread_num_ - 1) : 0;
+    const int kind = static_cast<int>(ProfBufferType::AICPU_ORCH_PHASE);
+
+    for (int s = 0; s < PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD; s++) {
+        void *host_buf_ptr = nullptr;
+        void *dev_buf_ptr = alloc_paired_buffer(buffer_bytes, &host_buf_ptr);
+        if (dev_buf_ptr == nullptr) {
+            LOG_ERROR(
+                "Failed to allocate orch phase buffer %d while raising the level to %d", s,
+                static_cast<int>(chip_swimlane_level)
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_buf_ptr)->count = 0;
+        if (s < initial_free_count) {
+            state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
+        } else if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+            (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+        }
+    }
+
+    // Slots before tail, and each published on its own: the region-wide push in
+    // initialize() is not available here, because on a later run it would also
+    // roll back every device-written field the mirror has since advanced.
+    wmb();
+    publish_field(
+        &state->free_queue.buffer_ptrs[0], static_cast<size_t>(initial_free_count) * sizeof(uint64_t),
+        "orch free_queue slots"
+    );
+    state->free_queue.tail = static_cast<uint32_t>(initial_free_count);
+    wmb();
+    publish_field(&state->free_queue.tail, sizeof(state->free_queue.tail), "orch free_queue tail");
+
+    LOG_INFO("Built the device orch-phase pool on demand for level %d", static_cast<int>(chip_swimlane_level));
+    return 0;
+}
+
 void ChipSwimlaneCollector::reset_collector_shards() {
     const size_t shard_count = static_cast<size_t>(manager_.shard_count());
 
@@ -593,7 +647,7 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
         auto &dst = perf_records_by_collector_[shard][core_index];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_perf_collected += count;
     }
@@ -612,7 +666,7 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
         auto &dst = sched_phase_records_by_collector_[shard][tidx];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_sched_phase_collected += count;
         if (count > 0) {
@@ -634,7 +688,7 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
         auto &dst = orch_phase_records_by_collector_[shard][tidx];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back(buf->records[i]);
+            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
         }
         collector_counters_[shard].total_orch_phase_collected += count;
         if (count > 0) {
@@ -684,7 +738,7 @@ void ChipSwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int 
                 skipped++;
                 continue;
             }
-            dst.push_back(r);
+            dst.push_back({r, buf->run_epoch, buf->local_seq, 0});
         }
     }
     if (skipped > 0) {
@@ -717,15 +771,17 @@ void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int
 // reconcile_counters / read_phase_header_metadata
 // ---------------------------------------------------------------------------
 //
-// Host never recovers records from device-side current_buf_ptr. Device flush
-// is the only data path: a flush failure must bump dropped_record_count and
-// clear current_buf_ptr on the device side. Host's job here is purely
-// accounting + sanity check.
+// Host never recovers records from device-side current_buf_ptr. Device flush is
+// the only data path: a flush failure bumps dropped_record_count and zeroes the
+// buffer's count, but the buffer stays the pool's — AICPU consumes the free
+// queue and never produces into it, so reuse by the next run's init is its only
+// return. Host's job here is purely accounting + sanity check.
 
 void ChipSwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
         return;
     }
+    report_drain_drops();
     merge_collector_shards();
 
     // Refresh the pool states (current_buf_ptr + total/dropped counters) from
@@ -733,8 +789,18 @@ void ChipSwimlaneCollector::reconcile_counters() {
     // state. Per-buffer contents are pulled individually inside reconcile_one —
     // an un-flushed active buffer was never enqueued, so the mgmt loop's
     // process_entry never copied its contents into the shadow.
+    //
+    // `mirror_ok` records whether these bytes actually arrived. The existing
+    // reconcile logging is unchanged by a failure — it reports whatever the
+    // shadow holds, as it always has — but the terminal-snapshot comparison
+    // refuses to call a stale mirror agreement.
+    live_counters_.mirror_ok = true;
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        int mirror_rc = profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        if (mirror_rc != 0) {
+            live_counters_.mirror_ok = false;
+            LOG_WARN("ChipSwimlane reconcile: shared-memory mirror refresh failed (rc=%d)", mirror_rc);
+        }
     }
     rmb();
 
@@ -745,14 +811,22 @@ void ChipSwimlaneCollector::reconcile_counters() {
     // and any non-zero silent loss flags an unaccounted gap on top of the
     // already-classified dropped losses.
     //
-    // Sanity sub-check: after stop(), any active buffer with records must
-    // have been flushed by AICPU (success → current_buf_ptr=0; failure →
-    // bump dropped, clear count + current_buf_ptr). A non-zero pointer with
-    // non-zero count means records AICPU neither delivered nor accounted
-    // for — i.e. a device-side flush bug. Empty buffers (count=0, never
-    // written) are fine; AICPU's flush legitimately skips them.
+    // Sanity sub-check: after stop(), a retained buffer must hold no records.
+    // Two outcomes leave `current_buf_ptr` set, and both are legitimate: a run
+    // with nothing to publish, and one whose enqueue failed (which charges
+    // `dropped` and zeroes `count` first). Either way the count is 0 and the
+    // next run's init reuses the buffer in place. A non-zero pointer with a
+    // non-zero count is the bug: those records were neither delivered nor
+    // charged to `dropped`.
+    //
+    // This check covers the PERF and PHASE pools. The AICore task pool is not
+    // reconciled here at all, so it says nothing about that pool either way.
+    // `live_out` is non-null only for the PERF class, whose device sums the
+    // terminal-snapshot comparison reads back. Set at the point the sums are
+    // complete, before the early return below can skip the logging.
     auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
-                             auto read_buf_count, size_t buf_size, uint64_t collected, bool optional) {
+                             auto read_buf_count, size_t buf_size, uint64_t collected, bool optional,
+                             LiveTaskCounters *live_out) {
         int leftover_active = 0;
         for (int i = 0; i < unit_count; i++) {
             ChipSwimlaneAicpuTaskPool *state = get_state(i);
@@ -780,6 +854,11 @@ void ChipSwimlaneCollector::reconcile_counters() {
             ChipSwimlaneAicpuTaskPool *state = get_state(i);
             total_device += state->head.total_record_count;
             dropped_device += state->head.dropped_record_count;
+        }
+        if (live_out != nullptr) {
+            live_out->aicpu_task_total = total_device;
+            live_out->aicpu_task_dropped = dropped_device;
+            live_out->live_ok = true;
         }
 
         // PHASE counters are populated only by runtimes that actually emit
@@ -826,7 +905,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
+        sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false, &live_counters_
     );
 
     reconcile_one(
@@ -837,7 +916,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
+        sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true, nullptr
     );
 
     reconcile_one(
@@ -848,8 +927,240 @@ void ChipSwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
+        sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true, nullptr
     );
+}
+
+// ---------------------------------------------------------------------------
+// Retained per-run terminal snapshots
+// ---------------------------------------------------------------------------
+//
+// publish_run_config below zeroes every pool head at each begin_run, so a run's
+// record totals do not survive its successor. A producer's last flush copies its
+// settled total/dropped into this run's bank, which the host arms per run from
+// the run's actual pipeline slot and reads back only after that run's completion
+// has been established. The bank is retained storage: nothing clears it between
+// runs, so the previous occupant's snapshot stays readable until this run's
+// producers overwrite their own entries.
+
+void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch) {
+    if (shm_host_ == nullptr || perf_shared_mem_dev_ == nullptr) return nullptr;
+    if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) {
+        LOG_ERROR(
+            "ChipSwimlane terminal: pipeline slot %u exceeds the %d retained banks — no snapshot armed", bank_index,
+            PLATFORM_RUN_TERMINAL_BANKS
+        );
+        return nullptr;
+    }
+    // Zero is the entries' "no snapshot" state, so it cannot also be a run's
+    // identity; a run without one publishes no bank rather than claiming this
+    // one.
+    if (run_epoch == 0) return nullptr;
+
+    return get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
+}
+
+ChipSwimlaneCollector::RunTerminalSnapshot
+ChipSwimlaneCollector::read_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch) {
+    RunTerminalSnapshot snapshot;
+    snapshot.run_epoch = run_epoch;
+
+    if (shm_host_ == nullptr) return snapshot;
+    if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) return snapshot;
+    if (run_epoch == 0) return snapshot;
+
+    ChipSwimlaneRunTerminal *host_bank = get_run_terminal_bank(shm_host_, static_cast<int>(bank_index));
+    // Narrow and checked, rather than relying on the bulk mirror reconcile does:
+    // this is the only read of these bytes, and an unchecked copy would turn a
+    // failed transfer into a snapshot of whatever the shadow happened to hold.
+    //
+    // A platform whose host and device share the region installs no copy hook,
+    // so `perf_shared_mem_dev_` aliases `shm_host_` and there is nothing to
+    // transfer. That is a successful read of bytes already in place, not a
+    // skipped one: `transport_ok` is true either way, and it stays false only
+    // when a copy was attempted and failed.
+    if (perf_shared_mem_dev_ != nullptr && perf_shared_mem_dev_ != shm_host_) {
+        ChipSwimlaneRunTerminal *dev_bank = get_run_terminal_bank(perf_shared_mem_dev_, static_cast<int>(bank_index));
+        int rc = profiling_copy_from_device(host_bank, dev_bank, calc_run_terminal_bank_size());
+        if (rc != 0) {
+            LOG_WARN(
+                "ChipSwimlane terminal: bank %u copy-from-device failed (rc=%d) — snapshot unknown for epoch %lu",
+                bank_index, rc, static_cast<unsigned long>(run_epoch)
+            );
+            return snapshot;
+        }
+    }
+    snapshot.transport_ok = true;
+    rmb();
+
+    auto accumulate = [&](RunTerminalClassSnapshot &cls, int base, int count) {
+        for (int i = 0; i < count; i++) {
+            const ChipSwimlaneRunTerminal *entry = get_run_terminal(host_bank, base + i);
+            uint64_t entry_epoch = entry->run_epoch;
+            if (entry_epoch == 0) continue;  // producer never closed into this entry
+            if (entry_epoch != run_epoch) {
+                snapshot.foreign_entries++;
+                continue;
+            }
+            cls.producers++;
+            // Which index reported, not merely how many: a class whose count
+            // matches can still have an unexpected index standing in for a
+            // missing expected one.
+            cls.reported_indices.push_back(i);
+            cls.total += entry->total;
+            cls.dropped += entry->dropped;
+        }
+    };
+    accumulate(snapshot.aicpu_task, PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE, PLATFORM_MAX_CORES);
+    accumulate(snapshot.aicore_task, PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE, PLATFORM_MAX_CORES);
+    accumulate(snapshot.sched_phase, PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE, PLATFORM_MAX_AICPU_THREADS);
+    accumulate(snapshot.orch_phase, PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE, PLATFORM_MAX_AICPU_THREADS);
+
+    snapshot.valid = snapshot.aicpu_task.producers > 0 || snapshot.aicore_task.producers > 0 ||
+                     snapshot.sched_phase.producers > 0 || snapshot.orch_phase.producers > 0;
+    return snapshot;
+}
+
+namespace {
+
+const char *run_terminal_verdict_name(ChipSwimlaneCollector::RunTerminalVerdict v) {
+    switch (v) {
+    case ChipSwimlaneCollector::RunTerminalVerdict::Unknown:
+        return "unknown";
+    case ChipSwimlaneCollector::RunTerminalVerdict::NotApplicable:
+        return "n/a";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Unexpected:
+        return "unexpected";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Partial:
+        return "partial";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Disagree:
+        return "disagree";
+    case ChipSwimlaneCollector::RunTerminalVerdict::Agree:
+        return "agree";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
+ChipSwimlaneCollector::RunTerminalConsistency
+ChipSwimlaneCollector::run_terminal_consistency(const RunTerminalSnapshot &snapshot) const {
+    RunTerminalConsistency result;
+
+    // The phase classes stay Unknown, which is their default. Their producer
+    // counts live in the shared header as untagged device observations that no
+    // per-run reset clears, so a successful read cannot tell this run's counts
+    // from a previous run's — there is no independent denominator to compare
+    // against, and claiming coverage from that would be claiming more than the
+    // data supports.
+
+    // A failed transfer means the bytes examined below are not this run's.
+    if (!snapshot.transport_ok) return result;
+
+    // The expected index set for both task classes is [0, num_aicore_): the
+    // host passed that count to initialize(), so it does not depend on anything
+    // the device reports back.
+    const int expected = num_aicore_;
+
+    auto classify = [&](const RunTerminalClassSnapshot &cls, bool have_live, uint64_t live_total,
+                        uint64_t live_dropped) {
+        RunTerminalClassConsistency out;
+        out.expected_count = expected;
+        out.reported_count = cls.producers;
+
+        for (int index : cls.reported_indices) {
+            if (index >= expected) out.unexpected_count++;
+        }
+        int in_set = cls.producers - out.unexpected_count;
+        out.missing_count = expected - in_set;
+
+        if (out.unexpected_count > 0) {
+            // Ranked above a gap and above a sum difference, and reported even
+            // when the expected set is empty or the cardinality happens to
+            // match: an entry at an index no producer of this run owns says the
+            // identity mapping is wrong, which subsumes either of the others.
+            out.verdict = RunTerminalVerdict::Unexpected;
+            return out;
+        }
+        if (expected == 0) {
+            out.verdict = RunTerminalVerdict::NotApplicable;
+            return out;
+        }
+        if (out.missing_count > 0) {
+            out.verdict = RunTerminalVerdict::Partial;
+            return out;
+        }
+        if (!have_live) {
+            // Every expected producer reported, but there is nothing sound to
+            // compare the sums against.
+            out.verdict = RunTerminalVerdict::Unknown;
+            return out;
+        }
+        out.verdict = (cls.total == live_total && cls.dropped == live_dropped) ? RunTerminalVerdict::Agree :
+                                                                                 RunTerminalVerdict::Disagree;
+        return out;
+    };
+
+    const bool live_usable = live_counters_.live_ok && live_counters_.mirror_ok;
+    result.aicpu_task =
+        classify(snapshot.aicpu_task, live_usable, live_counters_.aicpu_task_total, live_counters_.aicpu_task_dropped);
+    // AICore has no live counterpart: reconcile_counters does not sum the
+    // AICore pool, so its coverage can be checked but its sums cannot be
+    // compared. It never reaches Agree or Disagree.
+    result.aicore_task = classify(snapshot.aicore_task, /*have_live=*/false, 0, 0);
+    return result;
+}
+
+void ChipSwimlaneCollector::report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch) {
+    if (shm_host_ == nullptr) return;
+
+    RunTerminalSnapshot snapshot = read_run_terminal_snapshot(bank_index, run_epoch);
+    if (!snapshot.transport_ok) {
+        LOG_INFO(
+            "ChipSwimlane terminal: bank %u unreadable for epoch %lu — no snapshot and no consistency verdict",
+            bank_index, static_cast<unsigned long>(run_epoch)
+        );
+        return;
+    }
+
+    auto log_class = [&](const char *kind, const RunTerminalClassSnapshot &cls) {
+        if (cls.producers == 0) return;
+        LOG_INFO(
+            "ChipSwimlane terminal: epoch %lu %s retained total=%lu dropped=%lu across %d producer(s)",
+            static_cast<unsigned long>(run_epoch), kind, static_cast<unsigned long>(cls.total),
+            static_cast<unsigned long>(cls.dropped), cls.producers
+        );
+    };
+    log_class("PERF", snapshot.aicpu_task);
+    log_class("AICORE", snapshot.aicore_task);
+    log_class("SCHED_PHASE", snapshot.sched_phase);
+    log_class("ORCH_PHASE", snapshot.orch_phase);
+
+    if (snapshot.foreign_entries > 0) {
+        // Expected on a reused bank: entries the previous occupant closed that
+        // this run's producers did not overwrite. Counted rather than summed,
+        // because they belong to another run's accounting.
+        LOG_INFO(
+            "ChipSwimlane terminal: bank %u holds %d entr(ies) from an earlier run", bank_index,
+            snapshot.foreign_entries
+        );
+    }
+
+    // Snapshot-vs-live consistency for this run only. It says whether the
+    // retained copy matches the live counters reconcile summed; it is not a
+    // statement that the run's accounting is complete, that no records were
+    // lost, or that the mechanism is sound under overlapping runs.
+    RunTerminalConsistency consistency = run_terminal_consistency(snapshot);
+    auto log_verdict = [&](const char *kind, const RunTerminalClassConsistency &c) {
+        LOG_INFO(
+            "ChipSwimlane terminal: epoch %lu %s snapshot-vs-live %s "
+            "(expected=%d reported=%d missing=%d unexpected=%d)",
+            static_cast<unsigned long>(run_epoch), kind, run_terminal_verdict_name(c.verdict), c.expected_count,
+            c.reported_count, c.missing_count, c.unexpected_count
+        );
+    };
+    log_verdict("PERF", consistency.aicpu_task);
+    log_verdict("AICORE", consistency.aicore_task);
 }
 
 void ChipSwimlaneCollector::publish_run_config() {
@@ -865,25 +1176,42 @@ void ChipSwimlaneCollector::publish_run_config() {
     // buffer_pool_manager.h's note on narrow write_range_to_device calls. On SVM
     // platforms copy_to_device is null and this is a no-op, because the store
     // above already landed in device-visible memory.
-    (void)manager_.write_range_to_device(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level));
+    publish_field(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level), "chip_swimlane_level");
+
+    // A level the device orch pool cannot serve produces an empty orch section
+    // and nothing else: the run completes, no buffer is lost, and reconcile
+    // balances, so there is no other signal that the level did not take effect.
+    // initialize() builds the pool on demand for exactly this case, so reaching
+    // here unstocked means a caller armed the run without it.
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::ORCH_PHASES && !host_orchestrated_ &&
+        get_orch_phase_buffer_state(shm_host_, 0)->free_queue.tail == 0) {
+        LOG_ERROR(
+            "ChipSwimlane: published level %d with no device orch-phase pool; the device will emit no orchestrator "
+            "phases this run",
+            static_cast<int>(chip_swimlane_level_)
+        );
+    }
 
     // The pools' record counters are producer-side and never reset by the
     // device, so they carry the previous run's totals into this run's reconcile
     // unless cleared here.
     //
-    // total_record_count and dropped_record_count are adjacent, so one narrow
-    // write covers both and leaves the device-owned fields in the same cache
-    // line (current_buf_ptr, current_buf_seq) untouched.
+    // The four counters are contiguous, so one narrow write covers all of them
+    // and leaves the device-owned fields in the same cache line
+    // (current_buf_ptr, current_buf_seq) untouched. `live` and `published` have
+    // to be cleared with the other two: the accounting identity
+    // `published + live + dropped == total` is per run, so clearing only part of
+    // it would leave the next run comparing a fresh total against carried-over
+    // published records.
     auto reset_head = [this](ChipSwimlaneActiveHead *head) {
         head->total_record_count = 0;
         head->dropped_record_count = 0;
+        head->live_record_count = 0;
+        head->published_record_count = 0;
         wmb();
-        static_assert(
-            offsetof(ChipSwimlaneActiveHead, dropped_record_count) ==
-                offsetof(ChipSwimlaneActiveHead, total_record_count) + sizeof(uint32_t),
-            "the two counters must stay adjacent for this single write-back to cover both"
-        );
-        (void)manager_.write_range_to_device(&head->total_record_count, 2 * sizeof(uint32_t));
+        // Contiguity is asserted where the struct is declared, next to the field
+        // order it constrains.
+        publish_field(&head->total_record_count, 4 * sizeof(uint32_t), "record counters");
     };
 
     // Every slot, not just this run's: the grid is dimensioned by the platform
@@ -1090,6 +1418,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // clock_freq_hz drives the cycles→µs conversion (a2a3 = 50 MHz, a5 =
     // 1 GHz — must come from the host, not be hardcoded in python).
     outfile << "  \"metadata\": {\n";
+    // Which runtime minted the records. A task_id carries whichever TaskId layout its
+    // runtime uses and nothing in the value says which, so a reader that decodes one
+    // has to be told; the name is a compile-time property of this host_runtime.so.
+    outfile << "    \"runtime\": \"" << SIMPLER_RUNTIME_NAME << "\",\n";
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
     outfile << "    \"num_cores\": " << num_aicore_ << ",\n";
     outfile << "    \"core_types\": [";
@@ -1215,8 +1547,15 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
-    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles]
+    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles,
+    //                  run_epoch]
+    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch]
+    //
+    // `run_epoch` is the trailing column on every per-task row and the join key's
+    // first component: reg_task_id restarts at 0 each run, so (core_id,
+    // reg_task_id) alone collides across runs sharing one file. A row whose epoch
+    // is absent is a pre-identity capture, not epoch 0 — the reader distinguishes
+    // by column count, never by value.
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
         // collecting from the device side, so no defensive filter here.
@@ -1228,10 +1567,12 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
-                for (const auto &r : collected_aicore_records_[core_idx]) {
+                for (const auto &collected : collected_aicore_records_[core_idx]) {
+                    const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
+                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << ", "
+                            << collected.run_epoch << "]";
                     first = false;
                     total++;
                 }
@@ -1247,14 +1588,15 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         if (scheduler_tasks_extension != nullptr) {
             outfile << *scheduler_tasks_extension;
         } else {
-            outfile << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicpu\",\n    \"records\": [";
+            outfile << "{\n    \"producer\": \"aicpu\",\n    \"records\": [";
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
-                for (const auto &r : collected_perf_records_[core_idx]) {
+                for (const auto &collected : collected_perf_records_[core_idx]) {
+                    const ChipSwimlaneAicpuTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
-                            << r.finish_time << "]";
+                            << r.finish_time << ", " << collected.run_epoch << "]";
                     first = false;
                     total++;
                 }
@@ -1276,9 +1618,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                 const auto *pool = get_sched_phase_buffer_state(shm_host_, static_cast<int>(t));
                 dropped_records[t] = pool->head.dropped_record_count;
             }
-            chip_swimlane_write_scheduler_records(
-                outfile, collected_sched_phase_records_, dropped_records, SIMPLER_RUNTIME_NAME
-            );
+            chip_swimlane_write_scheduler_records(outfile, collected_sched_phase_records_, dropped_records);
         }
 
         if (has_aicpu_orch_phases) {
@@ -1290,10 +1630,12 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             for (size_t t = 0; t < orch_lanes; t++) {
                 outfile << "    [";
                 bool first = true;
-                for (const auto &pr : collected_orch_phase_records_[t]) {
+                for (const auto &collected : collected_orch_phase_records_[t]) {
+                    const ChipSwimlaneAicpuOrchPhaseRecord &pr = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
-                            << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time << "}";
+                            << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
+                            << ", \"run_epoch\": " << collected.run_epoch << "}";
                     first = false;
                 }
                 if (!first) outfile << "\n    ";

@@ -36,6 +36,8 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
         directory.mkdir(parents=True)
 
     (workspace / ".venv/bin/activate").write_text(":\n")
+    cann_env = tmp_path / "set_env.sh"
+    cann_env.write_text(":\n")
     task_submit = bin_dir / "task-submit"
     task_submit.write_text(
         textwrap.dedent(
@@ -103,6 +105,7 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
     env = os.environ.copy()
     env.update(
         {
+            "CANN_ENV": str(cann_env),
             "DEVICE_RANGE": f"7-{6 + device_count}",
             "DEVICE_NUM": str(device_count),
             "DFX_PLATFORM": "a5",

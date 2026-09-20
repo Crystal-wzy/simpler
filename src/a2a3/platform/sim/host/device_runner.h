@@ -62,10 +62,10 @@ private:
      * device. Mirrors the onboard runner, where the claim is what keeps a
      * shape-driven pool release off a live predecessor.
      */
-    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level);
-    int init_args_dump(Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
+    int init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
     int init_pmu(int num_cores, int num_threads, int device_id);
     int init_dep_gen(int num_threads, int device_id);
     int init_scope_stats(int num_threads);
@@ -92,8 +92,10 @@ private:
     void (*set_scheduler_timeout_ms_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_phase_base_func_)(uint64_t){nullptr};
+    void (*set_platform_run_result_func_)(uint64_t, uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_chip_swimlane_base_func_)(uint64_t){nullptr};
+    void (*set_platform_chip_swimlane_run_terminal_bank_func_)(uint64_t){nullptr};
     void (*set_platform_chip_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};
     void (*set_chip_swimlane_enabled_func_)(bool){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};

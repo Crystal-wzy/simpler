@@ -262,6 +262,9 @@ layers to be aware of:**
 
   // Everything the python reader needs that isn't a per-record stream.
   "metadata": {
+    "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
+                                       // which TaskId layout every task_id in
+                                       // this document carries; see below.
     "clock_freq_hz": <int>,            // cycle→µs factor. a2a3=50e6, a5=1e9.
     "num_cores": <int>,                // == len(core_types)
     "core_types": ["aic"|"aiv", ...],  // indexed by core_id
@@ -270,12 +273,18 @@ layers to be aware of:**
 
   // Bulk task streams. Tuple column order is fixed.
   //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
-  //                  start_cycles, end_cycles]
+  //                  start_cycles, end_cycles, receive_to_start_cycles,
+  //                  run_epoch]
   //   scheduler_tasks.records: [core_id, reg_task_id,
-  //                             dispatch_cycles, finish_cycles]
+  //                             dispatch_cycles, finish_cycles, run_epoch]
+  //
+  // run_epoch is the trailing column on every per-task row and the first
+  // component of the join key. reg_task_id restarts at 0 each run and a
+  // graph's task ids repeat when it re-executes, so (core_id, reg_task_id)
+  // is unique only within one run. Readers join on
+  // (run_epoch, core_id, reg_task_id).
   "aicore_tasks": [[...], ...],
   "scheduler_tasks": {
-    "schema_version": 1,
     "producer": "<aicpu|aicore>",
     "records": [[...], ...]
   },
@@ -302,10 +311,8 @@ layers to be aware of:**
 
   // Producer-neutral per-Scheduler streams (level >= 3 only).
   "scheduler_records": {
-    "schema_version": 1,
     "streams": [{
       "platform": "<a2a3|a5>",
-      "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
       "producer": "<aicpu|aicore>",
       "scheduler_id": <int>,
       "worker_id": <int>,
@@ -313,26 +320,44 @@ layers to be aware of:**
       "physical_core_id": "<int|null>",
       "capture": {"committed": <int>, "dropped": <int>, "truncated": <bool>},
       "records": [{"start_cycles": <int>, "end_cycles": <int>,
-                   "loop_iter": <int>, "kind": <str>,
+                   "run_epoch": <int>, "loop_iter": <int>, "kind": <str>,
                    "tasks_processed": <int>, "task_id": "<int|null>"}],
       "metrics": [{"record_index": <int>, ...}]
     }]
   },
 
   // Orchestrator records (level >= 4 only).
-  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles}
+  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles, run_epoch}
   "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
 }
 ```
 
 All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
 join key between `aicore_tasks` and `scheduler_tasks.records` is
-`(core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
+`(run_epoch, core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
 `block_num > num_cores` and MIX cluster spread can dispatch the same
-`task_token_raw` to the same core multiple times. AICore is the
+`task_token_raw` to the same core multiple times. `run_epoch` leads the key
+because `core_id, reg_task_id` alone is unique only *within* a run:
+`reg_task_id` restarts at 0 every run, and a graph re-executed later reuses
+its task ids. AICore is the
 canonical producer of `task_token_raw`; the Scheduler producer stamps the
 dispatch / finish timestamps and the per-core join token. Archived raw files
 with the former `aicpu_tasks` array remain readable as `producer: "aicpu"`.
+
+Captures written before run identity existed — `aicore_tasks` rows of five or
+six columns, four-column `scheduler_tasks` rows, phase records without
+`run_epoch` — still read, with `run_epoch` parsed as `None`, meaning "this file
+recorded no identity". It is deliberately not `0`: that is an epoch a device can
+really be given, so defaulting to it would let a legacy capture collide with a
+real run.
+
+These artifacts carry no schema version. They are written by platform C++ in
+this repo and read by `swimlane_converter.py` from the same checkout and the
+same build, so a declared number could never disagree with the rows it
+describes — and a producer wrong about its own rows would stamp a wrong number
+too. Readers therefore key off the data: row width, and whether a phase record
+carries `run_epoch`. What *is* enforced is consistency within one stream, since
+a producer disagreeing with itself is the real defect.
 
 #### Reader output (µs domain)
 
@@ -341,12 +366,26 @@ microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
-| `task_id` | Runtime task id (`TaskId::raw`); its high 32 bits are also exposed split off as `ring_id`, which is a ring index under `tensormap_and_ringbuffer` and an id space under `host_build_graph` |
+| `task_id` | Runtime task id (`TaskId::raw`). The fields above its low 32 bits are also exposed split off, under names that differ by runtime because the layouts do — see the table below |
 | `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
 | `dispatch_time_us` | Scheduler timestamp when dispatch publication completed (filled at level >= 2) |
 | `finish_time_us` | Scheduler timestamp when completion processing began (filled at level >= 2) |
+
+`metadata.runtime` decides which split-off fields a task row carries, because a
+task id carries whichever `TaskId` layout its runtime uses and nothing in the
+value says which. It is stated once, at document level: a stream carries no
+runtime of its own, since one run compiles against one runtime and streams exist
+only at level >= 3. A document without the key, or naming a runtime the tools do
+not decode, is **refused** rather than decoded by guess — guessing yields labels
+that read as valid and are wrong (an hbg sub-task read as tmr becomes a plausible
+`r3t5` with a billion-scale ring). Re-capture with a current build.
+
+| `metadata.runtime` | layout | split-off fields |
+| ------------------ | ------ | ---------------- |
+| `host_build_graph` | id space in bits 63:62 (`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`), a sub-task's parent modular task in bits 51:32, local id in the low 32 | `id_space`, plus `parent_task_id` for a sub-task |
+| `tensormap_and_ringbuffer` | ring index in bits 39:32, local id in the low 32 | `ring_id` |
 
 Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
@@ -356,6 +395,15 @@ Phase records (per Scheduler stream, level >= 3 in raw
 `scheduler_records`—also exposed through the legacy reader alias
 `aicpu_scheduler_phases`—and level >= 4 for
 `aicpu_orchestrator_phases[]`):
+
+On disk, `streams[]` carries only the Schedulers that recorded something — a
+thread that stayed idle is omitted rather than written as an empty stream. In the
+reader's output the list is re-expanded so that **position is the stream's own
+`scheduler_id`**, with the omitted ids left as empty lists. Consumers rely on
+that: `core_to_thread` holds AICPU thread indices, so
+`sched_overhead_analysis.compute_dag_stats_from_deps` and the scene tests index
+`scheduler_records` by those values directly. Keep any new consumer on list
+position, and keep the parallel `scheduler_streams` metadata list aligned to it.
 
 | Field | Meaning |
 | ----- | ------- |
@@ -367,9 +415,12 @@ Phase records (per Scheduler stream, level >= 3 in raw
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
 The raw scheduler record has a phase-tagged union: `dispatch` stores
-`pop_hit` / `pop_miss`, while `dummy_task` and `predicated_skip` store the
-32-bit `local_id` and `ring_id` components of their full task id. The Host
-collector reconstructs the `task_id` JSON field.
+`pop_hit` / `pop_miss`, while `dummy_task`, `predicated_skip` and
+`graph_prepare` store a whole `TaskId` — the first two naming the task retired,
+`graph_prepare` the outer GRAPH task whose body it materialized. The union sits
+ahead of the record's 32-bit fields so its 8-byte alignment does not pad the
+record past its 64-byte line. The Host collector writes that handle's `raw`
+straight into the `task_id` JSON field.
 
 Scheduler phase taxonomy — three role classes share one `phase`
 field but render differently in Perfetto:
@@ -380,7 +431,7 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Cluster Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
+| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Scheduler-local Dispatch Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
 | `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
 | `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
 | `release` | outer | sched | deferred-release slots drained this iter |

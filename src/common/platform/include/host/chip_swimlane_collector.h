@@ -35,6 +35,7 @@
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/clock_correlation.h"
+#include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -337,8 +338,11 @@ using ChipSwimlaneFreeCallback = profiling_common::ProfFreeCallback;
  *   7. export_swimlane_json() / finalize().
  *
  * Host never reads from device-side `current_buf_ptr` to recover records:
- * device flush is the only data path. Any non-zero `current_buf_ptr` after
- * stop() is logged as a bug.
+ * device flush is the only data path. A non-zero `current_buf_ptr` after stop()
+ * means the pool still owns that buffer, which is legitimate — a run with
+ * nothing to publish, or one whose enqueue failed, keeps it for the next run's
+ * init to reuse in place. Only a retained buffer whose `count` is non-zero is a
+ * bug: those records were neither delivered nor charged to `dropped`.
  */
 class ChipSwimlaneCollector : public profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule> {
 public:
@@ -420,6 +424,9 @@ public:
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
         json_extensions_.fill({});
+        // The previous run's live figures are not this run's; a comparison must
+        // report unknown until this run's reconcile has produced its own.
+        live_counters_ = LiveTaskCounters{};
         reset_collector_shards();
         publish_run_config();
     }
@@ -433,6 +440,22 @@ public:
      * phase-record vector.
      */
     void on_buffer_collected(const ReadyBufferInfo &info, int collector_shard);
+
+    /**
+     * Per-shard AICore records as collected, each with the run it came from.
+     * Exposed for the identity/ownership tests, which need the pre-merge view:
+     * the merge into `collected_aicore_records_` only runs at reconcile.
+     */
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> &
+    collected_aicore_records_for_test() const {
+        return aicore_records_by_collector_[0];
+    }
+
+    /** Per-shard AICPU task records as collected, each with its run. */
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &
+    collected_perf_records_for_test() const {
+        return perf_records_by_collector_[0];
+    }
 
     /**
      * Publish per-core core_type (AIC/AIV/...) so the host emit path can
@@ -555,9 +578,158 @@ public:
     void reconcile_counters();
 
     /**
+     * One producer class's retained terminal accounting for one run.
+     *
+     * `producers` counts the entries that carried the expected epoch, so a class
+     * whose pools were disabled reports zero producers rather than zero records
+     * — the two are different facts.
+     *
+     * `reported_indices` records *which* indices those were, not merely how
+     * many. Cardinality alone cannot tell a complete set from one where an
+     * unexpected index stands in for a missing expected one.
+     */
+    struct RunTerminalClassSnapshot {
+        int producers{0};
+        uint64_t total{0};
+        uint64_t dropped{0};
+        std::vector<int> reported_indices;
+    };
+
+    /**
+     * A run's retained terminal snapshot, read back from its bank.
+     *
+     * `transport_ok` says the bank's bytes reached the host: the device copy
+     * succeeded, or the platform shares memory and no copy was needed. It is a
+     * property of the read, not of the contents — an all-zero bank and a bank
+     * holding only another run's entries are both successfully read.
+     *
+     * `valid` says at least one entry carried this run's epoch. It is entry
+     * presence, never coverage and never read success; a class's `producers`
+     * count is what carries how much of that class reported.
+     *
+     * The two combine into distinct outcomes, and a reader must not collapse
+     * them. `!transport_ok` means the input never arrived: nothing about the run
+     * is known, and no verdict follows. `transport_ok && !valid` means the bank
+     * was read and holds no entry for this run, which is a real observation —
+     * every expected producer is absent, which the consistency verdict reports
+     * as `Partial`, not as unknown.
+     *
+     * A matching non-zero epoch is the per-entry test. It also covers the
+     * allocation's lifetime without a second mechanism: `initialize()` refuses
+     * while a region is held, so a new one only follows `finalize()`, which nulls
+     * the region pointer, and the new region's entries start at the zeroed
+     * no-snapshot state.
+     */
+    struct RunTerminalSnapshot {
+        bool transport_ok{false};
+        bool valid{false};
+        uint64_t run_epoch{0};
+        int foreign_entries{0};  // entries holding some other run's epoch
+        RunTerminalClassSnapshot aicpu_task;
+        RunTerminalClassSnapshot aicore_task;
+        RunTerminalClassSnapshot sched_phase;
+        RunTerminalClassSnapshot orch_phase;
+    };
+
+    /**
+     * How one producer class's retained snapshot compares with the live pool
+     * counters that `reconcile_counters` summed for the same run.
+     *
+     * Both sides are device-derived and written by the same producer, so this
+     * states whether the retained copy agrees with the live one. It is not a
+     * record-loss finding: host-collected loss is reconcile's own
+     * `collected + dropped == total` check, which stays authoritative.
+     */
+    enum class RunTerminalVerdict {
+        Unknown,        // a required input was missing or unreadable
+        NotApplicable,  // no producer of this class was expected on this run
+        Unexpected,     // an entry carries this run's epoch at an index outside the expected set
+        Partial,        // an expected index published no entry for this run
+        Disagree,       // the expected indices all reported, but the sums differ
+        Agree,          // the expected indices all reported and the sums match
+    };
+
+    /**
+     * Return the device address of `bank_index`'s first terminal entry for the
+     * run identified by `run_epoch`, or nullptr when there is nothing to arm (no
+     * region, no device allocation, bank out of range, or a zero epoch). The
+     * caller publishes the result into KernelArgs; a nullptr becomes a zero
+     * field, which the device reads as "publish no snapshot".
+     *
+     * Deliberately does not clear the bank. The previous occupant's snapshot
+     * stays readable until this run's producers overwrite their own entries, and
+     * zeroing here would destroy it at the one moment a reader might still want
+     * it. Entries start zeroed by the region's initialization memset.
+     */
+    void *arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * Read back the snapshot armed for `run_epoch` at `bank_index`.
+     *
+     * Only sound after that run's completion has been established positively —
+     * this performs no synchronization of its own and assumes no producer is
+     * still writing. Callers gate on the device completion fence.
+     */
+    RunTerminalSnapshot read_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * One producer class's snapshot-vs-live consistency result.
+     *
+     * `expected_count` is meaningful only for the task classes, whose expected
+     * index set is `[0, num_aicore_)` and is host-known. The phase classes have
+     * no host-side expected set — see `run_terminal_consistency`.
+     */
+    struct RunTerminalClassConsistency {
+        RunTerminalVerdict verdict{RunTerminalVerdict::Unknown};
+        int expected_count{0};
+        int reported_count{0};
+        int missing_count{0};
+        int unexpected_count{0};
+    };
+
+    struct RunTerminalConsistency {
+        RunTerminalClassConsistency aicpu_task;
+        RunTerminalClassConsistency aicore_task;
+        RunTerminalClassConsistency sched_phase;
+        RunTerminalClassConsistency orch_phase;
+    };
+
+    /**
+     * Compare this run's retained snapshot with the live pool counters
+     * `reconcile_counters` summed for the same run.
+     *
+     * Scope: snapshot-vs-live consistency for one run under the current
+     * exclusivity, per-run reset and completion-fence preconditions. It does
+     * not establish that a run's accounting is complete, that the host lost no
+     * records, or that snapshots would remain sound under overlapping runs.
+     *
+     * Only the task classes are compared. Their expected index set is
+     * `[0, num_aicore_)`, which the host supplies to `initialize()` and
+     * therefore knows independently of anything the device reports. The phase
+     * classes report `Unknown`: their producer counts exist only as untagged
+     * device observations in the shared header, which no per-run reset clears,
+     * so a successful read cannot distinguish this run's counts from a previous
+     * run's. Supplying an independent phase denominator needs configuration the
+     * host does not have, and is not attempted here.
+     *
+     * Must be called after `reconcile_counters` for the same run, which is what
+     * captures the live side.
+     */
+    RunTerminalConsistency run_terminal_consistency(const RunTerminalSnapshot &snapshot) const;
+
+    /**
+     * Read the snapshot, compare it with the live counters, and log both beside
+     * `reconcile_counters`' accounting. Diagnostic only: it changes no run
+     * outcome and reconcile stays authoritative.
+     */
+    void report_run_terminal_snapshot(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
      * @return Per-core ChipSwimlaneAicpuTaskRecord vectors (indexed by core_index). For tests.
      */
-    const std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> &get_records() const { return collected_perf_records_; }
+    const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> &get_records() const {
+        return collected_perf_records_;
+    }
 
 private:
     struct alignas(64) CollectorShardCounters {
@@ -603,16 +775,16 @@ private:
     std::array<std::string, static_cast<size_t>(ChipSwimlaneExtensionSection::Count)> json_extensions_{};
 
     // Merged data, populated from per-collector shards after collector threads join.
-    std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> collected_perf_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>>> collected_perf_records_;
 
     // Collected AICore records (per-core vectors). Each entry is a full
     // ChipSwimlaneAicoreTaskRecord captured from a rotated ChipSwimlaneAicoreTaskBuffer.
-    std::vector<std::vector<ChipSwimlaneAicoreTaskRecord>> collected_aicore_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>>> collected_aicore_records_;
 
     // AICPU phase profiling data — separate per-thread vectors for sched and
     // orch records (kind-tagged at routing time; no parse-time discrimination).
-    std::vector<std::vector<ChipSwimlaneAicpuSchedPhaseRecord>> collected_sched_phase_records_;
-    std::vector<std::vector<ChipSwimlaneAicpuOrchPhaseRecord>> collected_orch_phase_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> collected_sched_phase_records_;
+    std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>>> collected_orch_phase_records_;
     std::vector<HostPhaseRecord> host_submit_records_;
     std::vector<HostPhaseRecord> host_upload_records_;
     simpler::dfx::ClockCorrelationSession clock_correlation_session_;
@@ -620,10 +792,10 @@ private:
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
 
-    RecordsByCollector<ChipSwimlaneAicpuTaskRecord> perf_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicoreTaskRecord> aicore_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicpuSchedPhaseRecord> sched_phase_records_by_collector_;
-    RecordsByCollector<ChipSwimlaneAicpuOrchPhaseRecord> orch_phase_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuTaskRecord>> perf_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicoreTaskRecord>> aicore_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>> sched_phase_records_by_collector_;
+    RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase_records_by_collector_;
     std::vector<CollectorShardCounters> collector_counters_;
 
     // Running totals used at reconcile time to cross-check device-side counters.
@@ -640,9 +812,42 @@ private:
     uint64_t host_phase_dropped_records_{0};
     uint64_t host_phase_submitted_tasks_{0};
 
+    // The live pool figures reconcile_counters summed for the current run, kept
+    // so the terminal-snapshot comparison reads the same numbers reconcile
+    // logged rather than re-deriving them.
+    //
+    // `live_ok` is false until a reconcile pass for this run has produced them,
+    // and `begin_run` clears it: a previous run's live figures are not this
+    // run's, and comparing against them would report agreement that was never
+    // established. Only the AICPU task class is captured — reconcile does not
+    // sum the AICore pool at all.
+    struct LiveTaskCounters {
+        bool live_ok{false};
+        bool mirror_ok{false};  // the bulk device mirror reconcile reads succeeded
+        uint64_t aicpu_task_total{0};
+        uint64_t aicpu_task_dropped{0};
+    };
+    LiveTaskCounters live_counters_{};
+
     size_t normalize_collector_shard(int collector_shard) const;
     void reset_collector_shards();
     void merge_collector_shards();
+
+    /**
+     * Give the device orch-phase pool its buffers when this run's level needs
+     * them and no earlier run built them.
+     *
+     * The pool's existence is the one thing initialize() derives from the level,
+     * and the level is the one part of a run's configuration that begin_run()
+     * re-publishes every run. Since initialize() returns early while the region
+     * is held, a run that escalates past ORCH_PHASES would otherwise publish a
+     * level the pool cannot serve and the device would emit nothing — no error,
+     * no reconcile gap, just an empty orch section.
+     *
+     * Idempotent, and a no-op below ORCH_PHASES or when the host orchestrator is
+     * this run's record source (it needs no device pool at any level).
+     */
+    int ensure_device_orch_pool(ChipSwimlaneLevel chip_swimlane_level);
 
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard);

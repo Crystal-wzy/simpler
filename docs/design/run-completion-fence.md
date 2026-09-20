@@ -93,7 +93,74 @@ The candidate that does not require a synchronize is
 `aclrtSetExceptionInfoCallback` — the driver invokes it when a device exception
 occurs, so the error arrives without anyone waiting. It is device-scoped rather
 than run-scoped and brings its own threading and lifetime contract, so it is a
-subsystem to design, not a call to drop in. It is unmeasured here.
+subsystem rather than a call to drop in.
+
+That subsystem now exists, is consumed, and refuses admission. The process owns
+the driver's single callback slot (`host/device_fault_monitor.h`), and each
+runner records the notices naming streams its own runs submit on, against the
+device's live generation (`host/device_health_state.h`, including the fence that
+retires a generation at a confirmed reset so one recovered fault cannot
+quarantine a card for the life of the process).
+
+**A notice the runner matches to one of its own run streams refuses future
+admission, and does nothing else.** `device_admits_new_run` composes that
+suspicion with the arch's own quarantine, and the shared c_api asks it at
+prepare and at launch. The run whose finalize recorded the notice keeps the
+outcome its own channels gave it; no drain, reset or recovery starts from a
+notice; no resource is reclaimed; and the teardown consumer records only.
+Unattributed, undecided, lost and dropped notices refuse nothing, and neither
+does the absence of a notice — silence is not evidence of health.
+
+What the match is, precisely: the notice names this device in the logical id
+space, and its stream id is one this runner's run boundaries were recorded on.
+That is **membership, not provenance.** It does not identify the submission that
+faulted — on a5 the same `stream_aicpu_` also carries binary load, AICPU init
+and callable registration — and it carries no time, so a late or recycled
+identity can refuse work the device would have served. That availability cost is
+the deliberate trade: a notice carries no run identity and can arrive late (16 s
+is the longest lag measured, not a bound the SDK promises), so no rule over this
+channel can distinguish a fault that impaired a run from one that did not.
+
+Two consequences follow from membership-not-provenance, and both are accepted
+rather than worked around:
+
+- **A control-plane failure the host already reported synchronously can still
+  refuse later admission.** On a5 the registration, binary-load and AICPU-init
+  submissions ride `stream_aicpu_`, which is also a run-boundary stream, so a
+  device exception raised by one of them matches. The caller has already seen
+  that failure as a return code; the notice refuses admission on top of it.
+- **There is no guarantee that an ordinary close and re-init is recovery.**
+  Admission returns only through the existing confirmed-generation-retirement
+  path — the force reset that confirms, then `retire_after_confirmed_device_reset`.
+  A reset that was not confirmed, or a notification delivered into the new
+  generation, leaves the runner refusing.
+
+A test that deliberately drives a device-side failure therefore must not share a
+worker with cases that expect a healthy runner. In the `prepared_callable`
+directories that case lives in its own class
+(`TestPreparedCallableRegistrationFailure`), because the worker fixture is
+class-scoped and `DevicePool.allocate` refuses rather than queues — a
+finer-scoped worker requested while the class's is still cached would need a
+second device. Class scope makes the two lifetimes sequential instead. That
+confines shared mutable runner state between an intentional-failure case and the
+positive cases around it; it is not a claim that the device is restored, since a
+notification delivered later can still name it.
+
+What a notice still cannot do is decide a run. The trigger is about the device
+and stays on its own axis: **a decided run result neither causes nor vetoes a
+device-health action.** A run that failed for its own reasons can leave a healthy
+card, and a run that succeeded can sit on a card that faulted underneath it —
+both were measured here. Result, health and resource retirement stay three
+separate decisions with three separate inputs, which is what the design has said
+since node A and what this channel must not quietly merge.
+
+Two limits of the generation fence, stated because neither is fixable from inside
+this channel. It skips notices **already in the ring** at the reset, so a fault
+caused before the reset but *delivered* after it still reads as the new
+generation's — the notice carries no timestamp, so the two are indistinguishable.
+And the stream identities it retires are held with finite capacity, so a
+sufficiently long generation reports attribution as undecided rather than
+claiming a notice is not its own.
 
 ### What this leaves open
 
@@ -103,9 +170,25 @@ open on this point, and replacing the read is a prerequisite of admitting a
 second launched run rather than a task that change can absorb. Concretely, that
 change owes:
 
-- an error channel that reports a device exception without a stream
-  synchronize, so a predecessor's drain stops depending on a successor's
-  kernels; and
+- ~~an error channel that reports a device exception without a stream
+  synchronize~~ — **delivered**, recorded per device generation, and refusing
+  future admission on a matched notice. It does **not** make removing the
+  normal-path synchronize safe: the rows that keep synchronizing include the
+  ordinary successful run that produces no notice at all, so this channel is a
+  fallback for uncovered work rather than a replacement for the verdict read;
+- every supported execution variant now has a terminal publication path. a5's
+  `host_build_graph` legacy executor was the last without one, and it now folds
+  and publishes on the same wire, epoch, selector and publisher as the other
+  three. A publication path is not a record per run: a run that failed in init,
+  one whose participants did not all claim the audited path, and an unmarked
+  fallback the wrapper rejects publish **nothing and stay undecided — but only
+  when no error is attributable to them**. `run_terminal_select` reports a
+  header or participant failure on those paths too; what the missing claim and
+  the unmarked mode withhold is the *success*, never the diagnosis. That is what
+  keeps "no record" from reading as success. What remains owed is
+  **authority** — the record is read diagnostically today, against the drain's
+  rc, and `report_terminal_disagreement` logs a disagreement rather than
+  overriding, so no consumer takes its outcome as the run's;
 - a decision on how a *successor's* fault is attributed, since a stream carries
   its error stickily and the predecessor's drain would otherwise report it.
 
@@ -114,6 +197,49 @@ and additionally reads the streams' *sticky* error state, which is exactly what
 the whole-pair query it replaced reported — so a poll that used to surface a
 stream left in error still does, and a poll that never detected a device
 exception (measured above: `rtStreamQuery` returns `0`) still does not.
+
+### Measured: the verdict read does wait, and the record read does not
+
+The paragraph above predicts that keeping the verdict read would make a
+predecessor's drain wait for its successor. That is now measured rather than
+argued, on a2a3, both runtimes — by `tests/st/run_retention`, which reaches a
+state production admission refuses (a predecessor complete and read but not
+finalized, while its successor executes on the same streams) through the fixture
+in `src/common/platform/onboard/host/run_retention_probe.h`.
+
+Two arms over one sequence, differing only in whether `sync_stream_pair` runs
+before the predecessor's result is read:
+
+| Arm | Successor's boundary, before → after the read | Successor's drain afterwards |
+| --- | --------------------------------------------- | ---------------------------- |
+| read the published record directly | Pending → **Pending** | 476 µs |
+| `sync_stream_pair` first (what `wait_run_fence` still appends) | Pending → **Complete** | 17 µs |
+
+**The Pending reading is the whole proof, and it is one-sided.** A read that
+waited for the successor could not have produced it, so an observed Pending
+settles the question. `Complete` does not settle the converse — the successor may
+simply have finished on its own — and no recorded quantity separates those two
+causes: a drain costs time on an already-finished run too, which is exactly what
+the control arm's 17 µs measures. The drain column is a cross-arm comparison, not
+a per-sample discriminator. `tests/st/run_retention` therefore treats a `Complete`
+attempt as inconclusive and retries, and fails only when no attempt ever observes
+the overlap.
+
+So:
+
+- **the record read is successor-independent** — 11–13 µs, flat across runtimes
+  and across successor size, and it yields a decided verdict rather than merely
+  returning early;
+- **the retained synchronize costs 283–429 µs with a successor in flight**, which
+  on `host_build_graph` is 3.6× the entire candidate drain (≈77 µs). It scales
+  with the successor's work where the candidate drain does not, which is the
+  argument in one line.
+
+The rule combining the two channels into one outcome is
+`decide_run_execution` (`host/run_outcome_decision.h`), which is pure and covered
+without a device. Wiring it into the drain, and removing the synchronize, is
+still #2267's remaining work — this establishes that the replacement is sound and
+what it saves, not that it has landed.
 
 ## Ownership: the run owns the facts, the runner owns the handles
 

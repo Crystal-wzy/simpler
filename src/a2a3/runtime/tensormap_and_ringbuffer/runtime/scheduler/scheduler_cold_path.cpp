@@ -218,8 +218,18 @@ bool SchedulerContext::no_thread_owns_running_task() const {
     return true;
 }
 
+// A stall dump's level follows its report, not its line: see StallDumpReport.
+#define STALL_DUMP_LOG(report, ...)                  \
+    do {                                             \
+        if ((report) == StallDumpReport::Shutdown) { \
+            LOG_WARN(__VA_ARGS__);                   \
+        } else {                                     \
+            LOG_INFO(__VA_ARGS__);                   \
+        }                                            \
+    } while (0)
+
 void SchedulerContext::log_stall_diagnostics(
-    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
+    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count, StallDumpReport report
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
 
@@ -269,7 +279,8 @@ void SchedulerContext::log_stall_diagnostics(
                 if (is_running) {
                     cnt_running++;
                     if (cnt_running > STALL_DUMP_READY_MAX) continue;
-                    LOG_INFO(
+                    STALL_DUMP_LOG(
+                        report,
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                         " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                         "running_on=[owner_thread=%d cores=[%s]]",
@@ -280,7 +291,8 @@ void SchedulerContext::log_stall_diagnostics(
                 if (rc >= fi) {
                     cnt_ready++;
                     if (cnt_ready > STALL_DUMP_READY_MAX) continue;
-                    LOG_INFO(
+                    STALL_DUMP_LOG(
+                        report,
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                         " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
@@ -289,7 +301,8 @@ void SchedulerContext::log_stall_diagnostics(
                 }
                 cnt_waiting++;
                 if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
-                LOG_INFO(
+                STALL_DUMP_LOG(
+                    report,
                     "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                     " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                     thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
@@ -298,7 +311,8 @@ void SchedulerContext::log_stall_diagnostics(
         }
         int32_t effective_total = task_count > 0 ? task_count : submitted_in_ring;
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-        LOG_INFO(
+        STALL_DUMP_LOG(
+            report,
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
             "scan_ready=%d scan_waiting=%d scan_running=%d",
             thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting, cnt_running
@@ -330,12 +344,14 @@ void SchedulerContext::log_stall_diagnostics(
             aiv1_buf, sizeof(aiv1_buf), aiv1_id, aiv1_idle, &core_exec_states_[aiv1_id],
             core_exec_states_[aiv1_id].reg_addr
         );
-        LOG_INFO(
-            "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
+        STALL_DUMP_LOG(
+            report, "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
             idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
     }
 }
+
+#undef STALL_DUMP_LOG
 
 void SchedulerContext::log_shutdown_stall_snapshot(
     int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
@@ -354,7 +370,9 @@ void SchedulerContext::log_shutdown_stall_snapshot(
         thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
     }
     for (int32_t t = 0; t < thread_count; t++) {
-        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count);
+        log_stall_diagnostics(
+            t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, StallDumpReport::Shutdown
+        );
     }
 }
 
@@ -767,6 +785,11 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
                 SPIN_WAIT_HINT();
                 continue;
             }
+            // The report's payload is Normal cacheable memory and nothing gives
+            // these loads an address or data dependency on the marker load, so
+            // without a load-load barrier they may be satisfied ahead of it.
+            // Once per accepted report, not per poll.
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count) {
                 LOG_ERROR(
@@ -868,6 +891,9 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
                 SPIN_WAIT_HINT();
                 continue;
             }
+            // See the contiguous-slice sweep above: the payload loads carry no
+            // dependency on the marker load, so they need the barrier between.
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count) {
                 LOG_ERROR(
@@ -988,6 +1014,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                     dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
                 }
+                dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
@@ -1316,6 +1343,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                 dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
             }
+            dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

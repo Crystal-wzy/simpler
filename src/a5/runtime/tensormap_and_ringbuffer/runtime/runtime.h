@@ -51,13 +51,9 @@
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
-
-// Default ready queue shards: one shard per worker thread (total minus orchestrator)
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -112,18 +108,6 @@ struct Handshake {
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
 
-/**
- * Task structure - Compatibility stub for platform layer
- *
- * RT2 uses DispatchPayload instead of Task for task dispatch.
- * This stub exists only for API compatibility with device_runner.cpp.
- * Since get_task_count() returns 0, this struct is never actually used.
- */
-struct Task {
-    int func_id;
-    uint64_t function_bin_addr;
-};
-
 // =============================================================================
 // Device launch descriptor
 // =============================================================================
@@ -157,7 +141,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via
@@ -238,6 +221,7 @@ public:
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
+    const Handshake *get_workers() const { return dev.workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -297,23 +281,13 @@ public:
     void clear_function_bin_addrs();
 
     // =========================================================================
-    // Deprecated API (for platform compatibility, always returns 0/nullptr)
-    // Task graph is now managed by RuntimeContext, not Runtime
-    // =========================================================================
-
-    /** @deprecated Task count is now in shared memory */
-    int get_task_count() const { return 0; }
-
-    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
-    Task *get_task(int) { return nullptr; }
-
-    // =========================================================================
     // Host-only state (not copied to device)
     // =========================================================================
 
-    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Host-only (after `dev`): never uploaded.
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated by
+    // runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
+    // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
 };
 
@@ -343,11 +317,15 @@ static_assert(
     "stays cache-line aligned"
 );
 
-// Number of bytes of the Runtime image that must be copied to the device.
-// trb returns sizeof(DeviceRuntimeLaunchDesc) (only `dev` is device-read);
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object). Defined per-runtime so the shared device_runner_helpers.cpp copy
-// path stays runtime-agnostic.
+// Bytes of the Runtime image the host uploads. Defined per-runtime so the shared
+// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
+// runtime-agnostic. A5 trb has no post-close gate array, so this equals the
+// device extent below.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes of device memory a Runtime image occupies, and the size every allocation
+// backing a device `Runtime` must use. Never smaller than
+// `runtime_device_copy_size`; equal to it on this runtime.
+size_t runtime_device_extent_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

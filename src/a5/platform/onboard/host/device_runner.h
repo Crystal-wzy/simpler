@@ -73,6 +73,12 @@
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+    // #2267's retention probe. There is no stream pair here to retire — every
+    // run submits on the persistent bootstrap streams — so what the probe needs
+    // instead is the single-run poll slot, which a successor's launch takes
+    // over and no path restores.
+    friend class RunRetentionProbePeer;
+
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
@@ -268,7 +274,7 @@ private:
      * rebuilds them. Neither is safe while another run is executing against
      * them, which is why none of it happens during preparation.
      */
-    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     /**
      * Commit this device's AICore register-address table on first use.
@@ -304,7 +310,8 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
+    int
+    init_args_dump(const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU profiling device buffers.

@@ -64,14 +64,15 @@ jobs:
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
-          build-packages: "scikit-build-core nanobind<3 cmake>=3.15"
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a5 .[test]"
           install-torch: "false"
           system-site-packages: "true"
-          source-cann: "false"
+          source-cann: "true"
 
       - name: Compile scene-test kernels (a5)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
             --platform a5 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
             --manual "$MANUAL_MODE"
@@ -81,6 +82,7 @@ jobs:
         env:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           for family in tensormap_and_ringbuffer host_build_graph; do
             .venv/bin/python "examples/a5/$family/qwen3_14b_decode/main.py" \
               --platform a5 --compile-only --compile-workers 8
@@ -88,6 +90,7 @@ jobs:
 
       - name: Run pytest scene tests (a5)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
             --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
 

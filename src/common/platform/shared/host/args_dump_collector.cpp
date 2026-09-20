@@ -81,7 +81,7 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
         DumpDataHeader *header = get_dump_header(shm_host_);
         header->dump_args_level = static_cast<uint32_t>(dump_args_level_);
         wmb();
-        (void)manager_.write_range_to_device(&header->dump_args_level, sizeof(header->dump_args_level));
+        publish_field(&header->dump_args_level, sizeof(header->dump_args_level), "dump_args_level");
 
         // The per-thread payload counters are what reconcile compares against,
         // and nothing on the device resets them. published/completed/dropped are
@@ -105,7 +105,7 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
             state->completed_payload_count = 0;
             state->dropped_record_count = 0;
             wmb();
-            (void)manager_.write_range_to_device(&state->published_payload_count, kCounterSpan);
+            publish_field(&state->published_payload_count, kCounterSpan, "payload counters");
         }
     }
 }
@@ -315,6 +315,11 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info, int
 
     if (count == 0) return;
 
+    // Read the identity before the loop: the device buffer goes back to the pool
+    // after this and a later run re-stamps it, so it may not be consulted again.
+    const uint64_t run_epoch = buf->run_epoch;
+    const uint32_t local_seq = buf->local_seq;
+
     if (count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
         LOG_ERROR(
             "Dump collector: invalid record count %u in buffer (thread=%u, seq=%u, max=%d), skipping", count,
@@ -347,6 +352,8 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info, int
     for (uint32_t i = 0; i < count; i++) {
         const ArgsDumpRecord &rec = buf->records[i];
         DumpedArg dt{};
+        dt.run_epoch = run_epoch;
+        dt.local_seq = local_seq;
         dt.task_id = rec.task_id;
         // rec is read from device shared memory (untrusted): clamp func_count so a
         // corrupt oversized value can't drive an out-of-bounds read of the
@@ -457,6 +464,7 @@ void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info, int
 
 void ArgsDumpCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
+    report_drain_drops();
 
     // Pull the latest BufferStates (current_buf_ptr, dropped_record_count)
     // before the per-thread loop so leftovers reflect post-stop() device
@@ -616,6 +624,29 @@ static uint64_t get_num_elements(const DumpedArg &dt) {
     return (dt.ndims == 0) ? 1 : numel;
 }
 
+void ArgsDumpCollector::request_writer_stop() {
+    // The stop flag must change under `write_mutex_`, not merely be atomic.
+    //
+    // `writer_loop` evaluates its predicate while holding that mutex and only
+    // then blocks, releasing the mutex as it registers on the condition
+    // variable. A stop that sets the flag without the mutex can land in the
+    // window between those two steps: the waiter has already read
+    // `writer_done_ == false`, is not yet registered, so `notify_one()` reaches
+    // nobody and the waiter blocks on a condition that is already true. The
+    // subsequent `join()` then never returns.
+    //
+    // Setting it under the mutex closes the window, because the waiter holds the
+    // mutex across its own check-then-block. This is the same rule
+    // `BufferPoolManager::notify_ready_waiters()` follows, and the reason the
+    // producer side at the payload-enqueue site is already correct: it pushes
+    // under the mutex and notifies afterwards.
+    {
+        std::scoped_lock<std::mutex> lock(write_mutex_);
+        writer_done_.store(true);
+    }
+    write_cv_.notify_one();
+}
+
 void ArgsDumpCollector::writer_loop() {
     while (true) {
         PayloadWriteRequest request;
@@ -684,10 +715,14 @@ int ArgsDumpCollector::export_dump_files() {
     // to skip when writer_started_ is false (collector ran but produced no
     // buffers, or never started at all).
     if (writer_started_) {
-        writer_done_.store(true);
-        write_cv_.notify_one();
+        request_writer_stop();
         while (writer_thread_.joinable()) {
-            if (write_queue_.empty()) {
+            size_t remaining = 0;
+            {
+                std::scoped_lock<std::mutex> lock(write_mutex_);
+                remaining = write_queue_.size();
+            }
+            if (remaining == 0) {
                 writer_thread_.join();
                 break;
             }
@@ -695,8 +730,8 @@ int ArgsDumpCollector::export_dump_files() {
                 std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - run_start_time_)
                     .count();
             LOG_INFO(
-                "Writing to disk: %.1f GB written, %zu args remaining (%lds)", bytes_written_.load() / 1e9,
-                write_queue_.size(), elapsed_s
+                "Writing to disk: %.1f GB written, %zu args remaining (%lds)", bytes_written_.load() / 1e9, remaining,
+                elapsed_s
             );
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -796,8 +831,8 @@ int ArgsDumpCollector::export_dump_files() {
         if (!first_entry) json << ",\n";
         first_entry = false;
 
-        json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
-             << "\"";
+        json << "    {\"run_epoch\": " << dt.run_epoch << ", \"task_id\": \"0x" << std::hex << std::setfill('0')
+             << std::setw(16) << dt.task_id << std::dec << "\"";
         json << ", \"func_id\": [";
         for (int32_t f = 0; f < dt.func_count; f++) {
             if (f) json << ", ";
@@ -861,8 +896,7 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     // the writer here too. Idempotent: export_dump_files() clears writer_started_
     // on the success path, making this a no-op.
     if (writer_started_ && writer_thread_.joinable()) {
-        writer_done_.store(true);
-        write_cv_.notify_one();
+        request_writer_stop();
         writer_thread_.join();
     }
 

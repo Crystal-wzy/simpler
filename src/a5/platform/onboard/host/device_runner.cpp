@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "run_retention_probe.h"
+
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
 #include "host_log.h"
@@ -330,6 +332,12 @@ int DeviceRunner::prepare_execution(
 
     ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
 
+    // A run without somewhere to publish its result must not launch: it would
+    // leave the host with no way to recover the run's own error scene, and a
+    // region still holding a predecessor's payload.
+    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    if (rc != 0) return rc;
+
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -348,8 +356,6 @@ int DeviceRunner::prepare_execution(
     // The AICore-visible half of this — the profiling flag and the swimlane /
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
     // reaches the device through a refreshed KernelArgs copy.
-
-    resolve_task_binary_addrs(runtime);
 
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
     // filter-style gate (see src/common/platform/onboard/aicpu/
@@ -437,11 +443,6 @@ int DeviceRunner::prepare_execution(
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
-    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_, slot_args);
-    if (rc != 0) {
-        LOG_ERROR("init_device_kernel_args failed: %d", rc);
-        return rc;
-    }
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = active_aicpu_num;
     prepare_rollback.dismiss();
@@ -453,6 +454,12 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
+    if (!prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
 
     Runtime &runtime = *prepared->runtime;
     const int num_aicore = prepared->num_aicore;
@@ -520,7 +527,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             run_poll_state_.store(RunPollState::Enqueuing, std::memory_order_release);
             LOG_INFO("=== launch_aicore_kernel ===");
             run_poll_state_.store(RunPollState::Submitted, std::memory_order_release);
-            int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.device_k_args_);
+            int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
@@ -618,7 +625,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
             LOG_WARN("Runtime chip-swimlane extension publication failed");
         }
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, false);
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false);
         emit_device_dep_gen_graph(prepared.dfx);
         return rc;
     }
@@ -627,7 +634,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
-    teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, true);
+    teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(prepared.dfx);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
@@ -645,8 +652,20 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
     // that failed mid-flight yields a whole graph or none — never a partial one.
     if (!dep_gen_collector_.reconcile_counters()) return;
     const std::string deps = make_deps_json_path(dfx.output_prefix);
-    const auto &records = dep_gen_collector_.records();
-    int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    // One deps.json describes one graph. A window with no records still gets a
+    // file — an empty graph is this run's answer, and suppressing it would make
+    // "nothing submitted" indistinguishable from "collection failed". Several
+    // runs in one window is the only case that cannot be emitted, because the
+    // path would have to name which run; that belongs with session output.
+    uint64_t dep_gen_run_epoch = 0;
+    const std::vector<DepGenRecord> *records = dep_gen_collector_.window_records(&dep_gen_run_epoch);
+    if (records == nullptr) {
+        LOG_ERROR(
+            "dep_gen collected %zu runs in one window — deps.json not produced", dep_gen_collector_.runs().size()
+        );
+        return;
+    }
+    int replay_rc = dep_gen_replay_emit_deps_json(records->data(), records->size(), deps.c_str());
     if (replay_rc != 0) {
         LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
     }
@@ -876,6 +895,11 @@ int DeviceRunner::force_reset_device() {
     LOG_WARN(
         "force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card (probe confirmed clean)", device_id_
     );
+    // The reset may or may not have cleared the process's exception-callback
+    // slot — that is unmeasured — so the registration is remade rather than
+    // assumed to have survived into this device generation. The evidence this
+    // generation accumulated retires here either way.
+    (void)retire_device_generation_after_confirmed_reset();
     return 0;
 }
 
@@ -1089,7 +1113,7 @@ int DeviceRunner::ensure_aicore_reg_table() {
     return 0;
 }
 
-int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int active_aicpu_num = prepared.launch_aicpu_num;
@@ -1112,6 +1136,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. Stated unconditionally: the field means "this run's
+    // bank", independently of whether the KernelArgs storage happens to be fresh.
+    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc =
@@ -1120,6 +1149,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {
@@ -1173,17 +1207,6 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     prepared.kernel_args.args.enable_profiling_flag = enable_profiling_flag;
 
-    // AICore's KERNEL_ENTRY reads the profiling flag and the swimlane / PMU ring
-    // tables out of the device copy of KernelArgs, and prepare uploaded that copy
-    // before any of the above ran. The AICPU side needs no refresh: it receives
-    // the host-side struct as the launch argument blob.
-    if (dfx.diagnostics_any()) {
-        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_, slot_persistent_args(prepared.pipeline_slot));
-        if (rc != 0) {
-            LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
-            return rc;
-        }
-    }
     return 0;
 }
 
@@ -1210,7 +1233,7 @@ int DeviceRunner::init_chip_swimlane(
 }
 
 int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
+    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
 ) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
@@ -1282,4 +1305,34 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
     }
     kernel_args.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
+}
+
+// =============================================================================
+// #2267's late-read retention fixture (see run_retention_probe.h)
+// =============================================================================
+
+void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
+    // Every run submits on the persistent bootstrap pair; there is no per-run
+    // stream here to look up.
+    *aicpu = runner.stream_aicpu_;
+    *aicore = runner.stream_aicore_;
+}
+
+int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
+    // Nothing to retire: the streams are the runner's for its whole lifetime,
+    // so a successor's launch waits on no ownership a predecessor holds. What
+    // it does take over is the poll slot, which `adopt_drain_ownership` below
+    // restores for teardown.
+    return 0;
+}
+
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &runner, const PreparedExecution &prepared) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    // Poll and drain accept exactly one run — whichever launched last — and no
+    // path restores the previous one, so the predecessor is undrainable through
+    // the ordinary entry once the successor has launched. This runs only after
+    // the successor has fully drained, so it hands the seat back rather than
+    // claiming two runs hold it at once.
+    self.run_poll_slot_.store(prepared.pipeline_slot, std::memory_order_relaxed);
+    self.run_poll_state_.store(DeviceRunner::RunPollState::DeviceComplete, std::memory_order_release);
 }

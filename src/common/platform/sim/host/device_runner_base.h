@@ -204,7 +204,17 @@ public:
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     );
 
-    std::thread create_thread(std::function<void()> fn);
+    /**
+     * Spawn a device-simulation thread bound to this runner's device.
+     *
+     * `name` is applied to the thread itself (Linux only, truncated to the
+     * kernel's 15-character limit); an empty name leaves the thread unnamed.
+     * A sim run holds one thread per simulated AICore plus one per AICPU, so
+     * over a hundred of them share this factory — without a name every one
+     * reports as the host process's own `comm` and a crash dump cannot say
+     * which tier faulted.
+     */
+    std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
 
     void *allocate_tensor(size_t bytes);
@@ -221,6 +231,15 @@ public:
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    /**
+     * Retain the host buffer a run assembles its device execution image in.
+     *
+     * Same retention contract as the shared-memory mirror above, and for the
+     * same reason a run needs it: the publication that ships these bytes is a
+     * separate step, so the source has to outlive the preparation that wrote
+     * it rather than dying with the caller's frame.
+     */
+    int acquire_run_image_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -351,6 +370,19 @@ public:
      * open and start their own.
      */
     void start_shared_collectors_for_run(const DfxRunConfig &dfx, uint32_t pipeline_slot);
+    /**
+     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
+     * return its device address for KernelArgs.
+     *
+     * The bank is the slice of the collector's retained region into which each
+     * producer copies its settled record totals at its last flush, so those
+     * totals survive the next run's counter reset. Indexed by the run's actual
+     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
+     * collector not initialized, slot out of range, or no run identity), which
+     * the device reads as "publish no snapshot". Diagnostic-only and never a
+     * prepare failure. Mirrors the onboard base.
+     */
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
@@ -363,9 +395,13 @@ public:
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper, as on onboard.
+     *
+     * `run_epoch` identifies the run whose retained terminal snapshot is read
+     * back, which happens only when `device_execution_complete` says the caller
+     * observed this run's completion.
      */
     void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
     /** Start the level-4 Host/Device clock correlation once per run. */
     void begin_clock_correlation_session_if_needed(uint32_t pipeline_slot) noexcept;
@@ -402,6 +438,7 @@ protected:
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
+    void release_run_image_stagings();
 
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
@@ -467,6 +504,16 @@ protected:
         size_t capacity{0};
     };
     std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+
+    // Host staging for the device execution image, one retained buffer per
+    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
+    // and the same grow-only retention as the mirror above; what differs is
+    // what it holds and how long it has to hold it. A bind assembles the
+    // bytes here and records where they go; the publication reads them
+    // afterwards, so this buffer is what makes the source outlive the
+    // preparation. Sized to the image a bind ships rather than to the
+    // mirror's capacity.
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
 
     // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They

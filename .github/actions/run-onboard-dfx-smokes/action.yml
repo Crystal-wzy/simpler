@@ -5,6 +5,10 @@ inputs:
   platform:
     description: Onboard platform, either a2a3 or a5.
     required: true
+  cann-env:
+    description: CANN environment setup script.
+    required: false
+    default: /usr/local/Ascend/cann/set_env.sh
 
 runs:
   using: composite
@@ -13,15 +17,15 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
+        CANN_ENV: ${{ inputs.cann-env }}
         DFX_PLATFORM: ${{ inputs.platform }}
       run: |
         set -euo pipefail
 
         case "$DFX_PLATFORM" in
-          a2a3)
-            source /usr/local/Ascend/cann/set_env.sh
+          a2a3|a5)
+            source "$CANN_ENV"
             ;;
-          a5) ;;
           *)
             echo "::error::unsupported onboard platform: $DFX_PLATFORM"
             exit 2

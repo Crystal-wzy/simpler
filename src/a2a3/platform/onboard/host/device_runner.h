@@ -81,6 +81,12 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper);
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+    // #2267's retention probe retires only this run's stream-pair ownership,
+    // on real boundary completion and without the drain that normally
+    // accompanies it, so its successor's `ensure()` is accepted while the
+    // predecessor's slot, result region and fence arming all stay alive.
+    friend class RunRetentionProbePeer;
+
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
@@ -142,6 +148,16 @@ public:
      * address is a query result and owns nothing.
      */
     int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+
+    /**
+     * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.
+     *
+     * a2a3-only, for the same reason `kernel_args_init_ffts_base_addr` is: a5's
+     * `InitArgs` has no such field, because only a2a3 reaches an uncached
+     * mapping by offsetting the address. Every failure yields 0, the value that
+     * leaves loads cached.
+     */
+    void fill_init_arch_fields(InitArgs &init_args) override;
 
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 
@@ -337,7 +353,7 @@ private:
      * rebuilds them. Neither is safe while another run is executing against
      * them, which is why none of it happens during preparation.
      */
-    int arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared);
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(
         int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
@@ -354,7 +370,8 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
+    int
+    init_args_dump(const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU streaming shared memory.

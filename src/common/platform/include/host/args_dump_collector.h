@@ -148,7 +148,7 @@ struct DumpModule {
 // lambda capture; register / unregister stay as plain function pointers
 // because they wrap stateless HAL globals. On a5 onboard the runner passes
 // register_cb=nullptr and the framework installs a malloc-shadow + DMA
-// fallback inline in ProfilerBase::start().
+// fallback inline in ProfilerBase::set_memory_context().
 using DumpAllocCallback = profiling_common::ProfAllocCallback;
 using DumpRegisterCallback = profiling_common::ProfRegisterCallback;
 using DumpUnregisterCallback = profiling_common::ProfUnregisterCallback;
@@ -162,6 +162,12 @@ using DumpFreeCallback = profiling_common::ProfFreeCallback;
  * Collected arg metadata + payload bytes
  */
 struct DumpedArg {
+    // Which run produced this arg. Copied from the device buffer's stamp at
+    // collection time, never read back from it: the pool reuses that storage and
+    // a later run re-stamps it in place. 0 means the producer had no run
+    // identity to stamp.
+    uint64_t run_epoch;
+    uint32_t local_seq;  // Producing buffer's position within its own run
     uint64_t task_id;
     int32_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // task's active-subtask set (mix membership); -1 unknown
     int32_t func_count;                        // number of valid entries in func_ids
@@ -373,6 +379,15 @@ private:
     std::atomic<uint64_t> bytes_written_{0};
 
     void writer_loop();
+
+    /**
+     * Ask the writer thread to finish, in the one order that cannot lose the
+     * wakeup: set the stop flag under `write_mutex_`, then notify. Both stop
+     * sites (export and finalize) go through here so neither can regress to a
+     * bare atomic store — see the definition for why the mutex is required even
+     * though the flag is atomic.
+     */
+    void request_writer_stop();
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_

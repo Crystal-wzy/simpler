@@ -45,6 +45,11 @@ _COMPILE_CACHE_SCHEMA = 1
 # applied to every onboard incore.
 _ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.py", "elf_parser.py")
 
+_CPU_SIM_TARGET_FLAGS = {
+    "a2a3sim": "-DPTO_CPU_SIM_TARGET_A2A3",
+    "a5sim": "-DPTO_CPU_SIM_TARGET_A5",
+}
+
 
 @cache
 def _artifact_logic_token() -> str:
@@ -89,9 +94,15 @@ class KernelCompiler:
     - compile_incore(): Compile a kernel source file for AICore/AIVector
     - compile_orchestration(): Compile an orchestration function for a given runtime
 
-    Toolchain selection is determined by C++ via get_incore_compiler() and
-    get_orchestration_compiler() (defined in runtime_compile_info.cpp).
-    Falls back to platform-based logic if the library is not yet loaded.
+    Toolchain selection happens here, not in C++. `_orchestration_toolchain()`
+    picks by runtime name — host_build_graph always compiles host-side, while
+    tensormap_and_ringbuffer cross-compiles for the AICPU unless the platform is
+    a sim — and `compile_incore()` picks by platform. The `get_incore_compiler()`
+    / `get_orchestration_compiler()` functions in the three
+    runtime_compile_info.cpp files (a2a3 and a5 host_build_graph, which are
+    identical, plus common/tensormap_and_ringbuffer, which draws the same
+    host-vs-AICPU line this method does) describe the same intent but have no
+    caller; nothing reads them over ctypes or from C++.
 
     Available toolchains:
     - CCEC: ccec compiler for AICore kernels (real hardware)
@@ -152,6 +163,18 @@ class KernelCompiler:
         if not self._sanitizers or not toolchain.is_host:
             return []
         return [f"-fsanitize={self._sanitizers}", "-fno-omit-frame-pointer", "-O1"]
+
+    def _sim_incore_compile_flags(self, core_type: str) -> list[str]:
+        """Return the complete compiler flags for one CPU-sim kernel."""
+        try:
+            target_flag = _CPU_SIM_TARGET_FLAGS[self.platform]
+        except KeyError as error:
+            raise ValueError(f"Unsupported CPU simulator platform: {self.platform}") from error
+        return [
+            *self.gxx15.get_compile_flags(core_type=core_type),
+            target_flag,
+            *self._sanitizer_flags(self.gxx15),
+        ]
 
     def get_platform_include_dirs(self) -> list[str]:
         """
@@ -344,7 +367,7 @@ class KernelCompiler:
         """Describe the compiler inputs shared by identical incore sources."""
         if self.platform.endswith("sim"):
             incore = self.gxx15
-            flags = [*incore.get_compile_flags(core_type=core_type), *self._sanitizer_flags(incore)]
+            flags = self._sim_incore_compile_flags(core_type)
             linker = None
         else:
             assert self.ccec is not None, "ccec toolchain is only available for hardware platforms"
@@ -745,8 +768,7 @@ class KernelCompiler:
         )
 
         # Build command from toolchain
-        cmd = [self.gxx15.cxx_path, *self.gxx15.get_compile_flags(core_type=core_type)]
-        cmd += self._sanitizer_flags(self.gxx15)
+        cmd = [self.gxx15.cxx_path, *self._sim_incore_compile_flags(core_type)]
 
         # Add PTO ISA header paths if provided. The path always comes from
         # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,

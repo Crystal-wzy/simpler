@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "run_retention_probe.h"
+
 #include "host_log.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 
@@ -32,9 +34,12 @@
 #include <thread>
 #include <vector>
 #include "acl/acl.h"
+#include "acl/error_codes/rt_error_codes.h"
 #include "host/acl_error_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
+// rt.h does not pull this in; it declares rtGetL2CacheOffset.
+#include "runtime/rt_preload_task.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -119,6 +124,26 @@ HalHostUnregisterFn get_halHostUnregister() {
 // =============================================================================
 // a2a3-only KernelArgsHelper extension
 // =============================================================================
+
+void DeviceRunner::fill_init_arch_fields(InitArgs &init_args) {
+    uint64_t offset = 0;
+    const int rc = rtGetL2CacheOffset(static_cast<uint32_t>(device_id_), &offset);
+    if (rc == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        LOG_INFO("fill_init_arch_fields: device %d has no nocache alias; L2 bypass stays a no-op", device_id_);
+        offset = 0;
+    } else if (rc != RT_ERROR_NONE) {
+        LOG_WARN(
+            "fill_init_arch_fields: rtGetL2CacheOffset failed: %d (device_id=%d); L2 bypass stays a no-op", rc,
+            device_id_
+        );
+        offset = 0;
+    } else {
+        LOG_INFO(
+            "fill_init_arch_fields: device %d nocache alias offset=0x%llx", device_id_, (unsigned long long)offset
+        );
+    }
+    init_args.l2_cache_offset = offset;
+}
 
 int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
     uint64_t ffts_base_addr{0};
@@ -297,6 +322,12 @@ int DeviceRunner::prepare_execution(
 
     ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
 
+    // A run without somewhere to publish its result must not launch: it would
+    // leave the host with no way to recover the run's own error scene, and a
+    // region still holding a predecessor's payload.
+    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    if (rc != 0) return rc;
+
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -323,8 +354,6 @@ int DeviceRunner::prepare_execution(
     // The AICore-visible half of this — the profiling flag and the swimlane /
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
     // reaches the device through a refreshed KernelArgs copy.
-
-    resolve_task_binary_addrs(runtime);
 
     // a2a3 onboard now uses the same host-computed, device-filtered affinity
     // shape as a5. Host probes the AICPU user pool once, chooses the active
@@ -393,13 +422,6 @@ int DeviceRunner::prepare_execution(
     rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
     if (rc != 0) {
         LOG_ERROR("init_ffts_base_addr failed: %d", rc);
-        return rc;
-    }
-
-    // Copy KernelArgs to device memory for AICore
-    rc = execution->kernel_args.init_device_kernel_args(mem_alloc_, slot_args);
-    if (rc != 0) {
-        LOG_ERROR("init_device_kernel_args failed: %d", rc);
         return rc;
     }
 
@@ -572,6 +594,12 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
+    if (!prepared->kernel_args.runtime_args_published()) {
+        LOG_ERROR("launch_execution: this run's Runtime descriptor has not been published");
+        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
 
     LaunchTransactionResult transaction = launch_run(*prepared, std::move(permit));
     if (transaction.poisoned()) recover_device_or_mark_unusable(transaction.rc);
@@ -663,7 +691,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             }
 
             LOG_INFO("=== launch_aicore_kernel ===");
-            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.device_k_args_);
+            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
@@ -717,7 +745,7 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
         // JSON manifest, i.e. unusable for triage. reconcile/export are not
         // idempotent, so this runs only on the error return; the success path
         // still exports exactly once below.
-        teardown_shared_collectors_after_run(dfx, pipeline_slot, false);
+        teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, false);
         emit_device_dep_gen_graph(dfx);
         return rc;
     }
@@ -726,7 +754,7 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    teardown_shared_collectors_after_run(dfx, pipeline_slot, true);
+    teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(dfx);
 
     return 0;
@@ -742,8 +770,20 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
     // that failed mid-flight yields a whole graph or none — never a partial one.
     if (!dep_gen_collector_.reconcile_counters()) return;
     const std::string deps = make_deps_json_path(dfx.output_prefix);
-    const auto &records = dep_gen_collector_.records();
-    int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+    // One deps.json describes one graph. A window with no records still gets a
+    // file — an empty graph is this run's answer, and suppressing it would make
+    // "nothing submitted" indistinguishable from "collection failed". Several
+    // runs in one window is the only case that cannot be emitted, because the
+    // path would have to name which run; that belongs with session output.
+    uint64_t dep_gen_run_epoch = 0;
+    const std::vector<DepGenRecord> *records = dep_gen_collector_.window_records(&dep_gen_run_epoch);
+    if (records == nullptr) {
+        LOG_ERROR(
+            "dep_gen collected %zu runs in one window — deps.json not produced", dep_gen_collector_.runs().size()
+        );
+        return;
+    }
+    int rc = dep_gen_replay_emit_deps_json(records->data(), records->size(), deps.c_str());
     if (rc != 0) {
         LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
     }
@@ -948,6 +988,11 @@ int DeviceRunner::force_reset_device() {
         "force_reset_device: aclrtResetDeviceForce(%d) established a usable device generation (probe confirmed)",
         device_id_
     );
+    // The reset may or may not have cleared the process's exception-callback
+    // slot — that is unmeasured — so the registration is remade rather than
+    // assumed to have survived into this device generation. The evidence this
+    // generation accumulated retires here either way.
+    (void)retire_device_generation_after_confirmed_reset();
     return 0;
 }
 
@@ -1203,7 +1248,7 @@ int DeviceRunner::finalize() {
 
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
-int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &prepared) {
+int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -1226,6 +1271,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     // phase pool. Publishing before the release would lose both.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
+    // This run's bank, so a run that arms none publishes 0 rather than whatever
+    // the last run left. Stated unconditionally: the field means "this run's
+    // bank", independently of whether the KernelArgs storage happens to be fresh.
+    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc =
@@ -1234,6 +1284,11 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
+        // After the init that publishes the region base: the bank is a slice of
+        // that region, and it is resolved per run because it is keyed on this
+        // run's pipeline slot and identity, not on the device's.
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {
@@ -1287,17 +1342,6 @@ int DeviceRunner::arm_collectors_for_run(Runtime &runtime, PreparedExecution &pr
     if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     prepared.kernel_args.args.enable_profiling_flag = enable_profiling_flag;
 
-    // AICore's KERNEL_ENTRY reads the profiling flag and the swimlane / PMU ring
-    // tables out of the device copy of KernelArgs, and prepare uploaded that copy
-    // before any of the above ran. The AICPU side needs no refresh: it receives
-    // the host-side struct as the launch argument blob.
-    if (dfx.diagnostics_any()) {
-        rc = prepared.kernel_args.init_device_kernel_args(mem_alloc_, slot_persistent_args(prepared.pipeline_slot));
-        if (rc != 0) {
-            LOG_ERROR("KernelArgs refresh after collector arming failed: %d", rc);
-            return rc;
-        }
-    }
     return 0;
 }
 
@@ -1341,7 +1385,7 @@ int DeviceRunner::init_chip_swimlane(
 }
 
 int DeviceRunner::init_args_dump(
-    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
+    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
 ) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
@@ -1502,4 +1546,31 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(unregister_cb, free_cb);
     }
+}
+
+// =============================================================================
+// Group Z — #2267's late-read retention fixture (see run_retention_probe.h)
+// =============================================================================
+
+void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    *aicpu = static_cast<rtStream_t>(self.run_streams_.aicpu());
+    *aicore = static_cast<rtStream_t>(self.run_streams_.aicore());
+}
+
+int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &runner, PreparedExecution &prepared) {
+    auto &self = static_cast<DeviceRunner &>(runner);
+    // Publishing the attempt before the call is what `drain_execution` does, and
+    // for the same reason: it keeps this run's later cleanup from replacing a
+    // proven Complete retirement with an Unproven one.
+    prepared.aicore_retirement_attempted = true;
+    // Complete keeps the AICore stream, so the successor's `ensure()` reuses the
+    // pair instead of replacing a stream this run has proven it is done with.
+    return self.retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+}
+
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const PreparedExecution &) {
+    // Poll and drain here key on the submitting run's own pointer, which a
+    // successor's launch does not overwrite, so a predecessor stays drainable
+    // through the ordinary entry with nothing restored.
 }

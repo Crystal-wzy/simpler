@@ -110,7 +110,7 @@ using ThreadFactory = std::function<std::thread(std::function<void()>)>;
  * - reg:              "register" dev_ptr for host visibility. On a5 this
  *                     allocates a paired host shadow (malloc + memset 0 +
  *                     copy_to_device of the zeros) and writes its address to
- *                     *host_ptr_out. ProfilerBase::start always installs a
+ *                     *host_ptr_out. ProfilerBase::set_memory_context always installs a
  *                     non-null reg wrapper — collectors do not need to
  *                     branch.
  * - free_:            free a previously allocated device pointer.
@@ -328,7 +328,7 @@ public:
     BufferPoolManager &operator=(const BufferPoolManager &) = delete;
 
     /**
-     * Configure the buffer pool's memory context. Called by ProfilerBase::start()
+     * Configure the buffer pool's memory context. Called by ProfilerBase::set_memory_context()
      * before any allocator-touching method (alloc_and_register_block /
      * free_buffer / resolve_host_ptr / drain_done_into_recycled) is invoked.
      * Must NOT be called concurrently with the mgmt thread.
@@ -347,6 +347,19 @@ public:
         shared_mem_host_ = shared_mem_host;
         shm_size_ = shm_size;
         device_id_ = device_id;
+    }
+
+    /**
+     * Forget the memory context without freeing buffers or clearing mappings.
+     * Call only after worker threads have stopped and resource cleanup is done;
+     * cleanup may still need the callbacks being cleared here.
+     */
+    void clear_memory_context() {
+        ops_ = MemoryOps{};
+        shared_mem_dev_ = nullptr;
+        shared_mem_host_ = nullptr;
+        shm_size_ = 0;
+        device_id_ = -1;
     }
 
     /**
@@ -530,19 +543,24 @@ public:
             return 0;
         }
         if (!ops_.copy_to_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<const volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, not pointer arithmetic. Rejecting a field outside
+        // the window is this function's job, so it is handed such a pointer by
+        // design — and forming `field + size` from one, or comparing it against
+        // an unrelated base, is not defined. `size > shm_size_` is checked first
+        // so the subtraction below cannot wrap.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::write_range_to_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         void *dev_field = static_cast<char *>(shared_mem_dev_) + offset;
-        return ops_.copy_to_device(dev_field, host_field, size);
+        return ops_.copy_to_device(dev_field, const_cast<const void *>(host_field_ptr), size);
     }
 
     /**
@@ -565,19 +583,20 @@ public:
             return 0;
         }
         if (!ops_.copy_from_device) return 0;
-        const auto *host_base = static_cast<const char *>(shared_mem_host_);
-        const auto *host_field = const_cast<const char *>(static_cast<volatile char *>(host_field_ptr));
-        if (host_field < host_base || host_field + size > host_base + shm_size_) {
+        // Integer addresses, for the same reason as write_range_to_device above.
+        const auto base = reinterpret_cast<uintptr_t>(shared_mem_host_);
+        const auto field = reinterpret_cast<uintptr_t>(host_field_ptr);
+        if (field < base || size > shm_size_ || field - base > shm_size_ - size) {
             LOG_ERROR(
                 "BufferPoolManager::read_range_from_device: field [%p, %p) outside shm [%p, %p)",
-                static_cast<const void *>(host_field), static_cast<const void *>(host_field + size),
-                static_cast<const void *>(host_base), static_cast<const void *>(host_base + shm_size_)
+                reinterpret_cast<const void *>(field), reinterpret_cast<const void *>(field + size),
+                reinterpret_cast<const void *>(base), reinterpret_cast<const void *>(base + shm_size_)
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        size_t offset = static_cast<size_t>(host_field - host_base);
+        size_t offset = static_cast<size_t>(field - base);
         const void *dev_field = static_cast<const char *>(shared_mem_dev_) + offset;
-        return ops_.copy_from_device(const_cast<void *>(static_cast<const void *>(host_field)), dev_field, size);
+        return ops_.copy_from_device(const_cast<void *>(host_field_ptr), dev_field, size);
     }
 
     /**
@@ -695,7 +714,7 @@ public:
     void notify_ready_waiters() {
         for (int shard_index = 0; shard_index < shard_count_; shard_index++) {
             auto &shard = ready_shards_[shard_index];
-            std::lock_guard<std::mutex> lock(shard.wait_mutex);
+            std::scoped_lock lock(shard.wait_mutex);
             shard.cv.notify_all();
         }
     }
@@ -1124,7 +1143,7 @@ private:
         return nullptr;
     }
 
-    // Subsystem inputs (set by ProfilerBase::start via set_memory_context).
+    // Subsystem inputs (set by ProfilerBase via set_memory_context).
     void *shared_mem_dev_{nullptr};
     void *shared_mem_host_{nullptr};
     size_t shm_size_{0};

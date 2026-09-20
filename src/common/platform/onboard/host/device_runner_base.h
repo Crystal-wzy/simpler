@@ -58,6 +58,7 @@
 #include "call_config.h"
 #include "callable.h"
 #include "common/device_phase.h"
+#include "common/device_run_result.h"
 #include "common/dma_workspace.h"
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
@@ -65,6 +66,8 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/device_fault_monitor.h"
+#include "host/device_health_state.h"
 #include "host/dfx_run_config.h"
 #include "host/execution_mode_latch.h"
 #include "host/host_phase_records.h"
@@ -74,7 +77,9 @@
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
+#include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
+#include "host/run_outcome_decision.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
 #include "host/args_dump_collector.h"
@@ -95,6 +100,12 @@ struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface he
  * is safe — it never runs as a virtual base destructor.
  */
 class DeviceRunnerBase {
+    // #2267's late-read retention probe reads this run's completion fence and
+    // result region directly, without the slot-gated poll/drain entries that
+    // a successor's launch takes over. Fixture access only — nothing in the
+    // product reaches these through the peer.
+    friend class RunRetentionProbePeer;
+
 public:
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
@@ -222,6 +233,15 @@ public:
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
+    /**
+     * Retain the host buffer a run assembles its device execution image in.
+     *
+     * Same retention contract as the shared-memory mirror above, and for the
+     * same reason a run needs it: the publication that ships these bytes is a
+     * separate step, so the source has to outlive the preparation that wrote
+     * it rather than dying with the caller's frame.
+     */
+    int acquire_run_image_staging(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -520,6 +540,108 @@ public:
     static uint64_t device_sys_cnt_frequency_hz() { return PLATFORM_PROF_SYS_CNT_FREQ; }
 
     /**
+     * This slot's last run's device-published result payload, or `nullptr` when
+     * that run published none.
+     *
+     * `run_epoch` is the epoch of the run whose result is wanted: a region still
+     * holding an earlier run's epoch is reported as absent rather than returned,
+     * so a caller cannot read a predecessor's payload as this run's. `*bytes_out`
+     * receives the published length.
+     *
+     * Absent carries no verdict. A producer attaches a payload only to a
+     * failure, so a successful run, a run that reported no detail and a run
+     * that never reached its publish point — one the op-execute watchdog
+     * reaped, say — all read as absent here. Whether the run succeeded is
+     * `device_run_terminal`'s answer, and it must not be inferred from the
+     * presence or absence of this payload, nor answered by reading shared
+     * device state, which by then may belong to a successor.
+     */
+    const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
+
+    /**
+     * Copy this slot's result region into the host-side copy `device_run_result`
+     * and `device_run_terminal` read. Call after the run's own completion
+     * boundaries: what makes the record this run's rather than a successor's is
+     * that its device side published it before its kernel returned, so this read
+     * itself races nothing — the slot is not handed on until the run holding it
+     * finalizes.
+     *
+     * One read per run. A repeat call for an epoch already read is a no-op, so
+     * every later consumer sees the same bytes and no path pays a second D2H —
+     * in particular a read must not be retried after a device recovery, which
+     * would sample a generation this run never wrote.
+     *
+     * Leaves the host copy empty when there is no region or the copy fails; a
+     * failed copy is recorded as such, so it reads as undecided rather than as
+     * an absent record, and a slot with no region records no attempt at all.
+     */
+    void read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+
+    /**
+     * What this slot's cached region says about the run whose epoch is
+     * `run_epoch`: succeeded, failed with the runtime's own signed code, or
+     * undecided with the reason.
+     *
+     * This is the run's execution outcome only. It does not say the device is
+     * healthy and it does not say the run's resources are retirable — a device
+     * can publish a failure and keep tearing down. Quiescence comes from the
+     * run's completion boundaries and its outstanding wait references.
+     */
+    DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
+
+    /**
+     * Which of the three read states this slot holds for `run_epoch`.
+     *
+     * The three answers are distinct evidence, which is why the caller gets
+     * them rather than a bool: a read that never happened, a copy that failed,
+     * and a copy that succeeded onto a region no run published into all leave
+     * the same empty bytes behind. A slot holding no region is the first of
+     * those, not the second — nothing was copied, so nothing was lost.
+     */
+    RunRecordRead device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const;
+
+    /**
+     * The boundary completion this run's own drain or poll observed, or
+     * `Pending` when none did.
+     *
+     * Retained from the observation rather than re-derived: by the time a
+     * caller asks, the drain's cleanup has retired the fence's arming, so the
+     * fence can no longer answer for this run. Reads no device state.
+     */
+    RunCompletionFence::Completion observed_run_boundaries(const NativeRunIdentity &identity) const;
+
+    /**
+     * Consume every notification reported since this runner last looked, and
+     * return how many named a stream **this runner's runs submit on**.
+     *
+     * A notice that matches refuses this runner's *future* admission, through
+     * the suspicion `accepts_new_run` reads. It decides no run: the notice names
+     * a device and a stream, carries no run identity, and can arrive late (16 s
+     * is the longest lag measured, not a bound), so it can name a fault from an
+     * earlier run than the one being finalized. It starts no drain, reset or
+     * recovery either, and reclaims nothing.
+     *
+     * The match is membership, not provenance. It says a fault landed on a
+     * stream this runner's runs use — on a5 that stream also carries binary
+     * load, AICPU init and callable registration — not that a run caused it and
+     * not that a run was impaired. So a control-plane failure the host already
+     * reported synchronously can still refuse later admission.
+     *
+     * Attribution is per stream, not merely per device: the notice's `device_id`
+     * is logical (the same space this runner names its device in) and its
+     * `stream_id` is a driver id compared against the ids this device's runs
+     * were recorded on at launch. A notice matching none of them is unattributed
+     * while that history is complete, and *undecided* once an id is missing —
+     * evicted by capacity, or never obtained because the query failed. Neither
+     * refuses anything, and neither does a lost or dropped notice; the ring is
+     * process-wide, and this runner speaks for its own streams.
+     */
+    uint64_t consume_device_fault_notices() noexcept;
+
+    /** Evidence this device's fault channel has produced in the live generation. */
+    const DeviceHealthState &device_health() const { return device_health_; }
+
+    /**
      * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
      * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15
      * — a *task* timing slot, unrelated to `pipeline_slot`.
@@ -725,6 +847,19 @@ public:
     virtual bool can_accept_run() const = 0;
 
     /**
+     * Whether the shared c_api may admit a new run on this runner.
+     *
+     * Composes the arch's own quarantine with the device-fault channel's
+     * generation-scoped suspicion; `device_admits_new_run` states what each
+     * refusal means and how each clears. Admission sites ask this. The two
+     * diagnostic readers of `can_accept_run()` — the clock-correlation session's
+     * abandon flag — deliberately keep asking the arch flag alone, because a
+     * matched notice says nothing about whether this run's own DFX resources are
+     * safe to release normally.
+     */
+    bool accepts_new_run() const { return device_admits_new_run(!can_accept_run(), device_health_); }
+
+    /**
      * An AICore launch or stream sync failed outside the per-run path. The arch
      * runner drains what it can and flips its device-unusable flag, so the next
      * admission fails fast and finalize() takes its fatal teardown path instead of
@@ -845,6 +980,13 @@ public:
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
     /**
+     * Fill the `InitArgs` fields only one architecture defines, before the init
+     * entry uploads them. Default: nothing, which is what an architecture whose
+     * `InitArgs` carries no such field needs — the base fills the common ones.
+     */
+    virtual void fill_init_arch_fields(InitArgs & /*init_args*/) {}
+
+    /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own
      * config, before it binds.
      *
@@ -895,10 +1037,12 @@ public:
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
      * 507899 cascade at `rtStreamCreate`.
      *
-     * `k_args` reaches the AICore kernel through `rtArgsEx_t` as a
-     * device-resident KernelArgs payload pointer.
+     * `k_args` is projected into `AicoreLaunchArgs` and reaches the AICore
+     * kernel as the `rtArgsEx_t` parameter block itself — by value, with no
+     * device-resident copy. The projection carries this run's final values, so
+     * the call must follow collector arming.
      */
-    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
+    int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
@@ -1133,6 +1277,33 @@ protected:
     int arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
+     * Point this run's KernelArgs at its slot's result region and stamp the run
+     * epoch the device must publish. Allocated lazily per slot and, unlike the
+     * timing buffer, never gated on diagnostics. Returns non-zero when the
+     * region could not be provided, which the caller must treat as a prepare
+     * failure: continuing would launch a run whose device side has nowhere to
+     * put its result, and whose region still holds a predecessor's payload.
+     */
+    int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
+
+    /**
+     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
+     * return its device address for KernelArgs.
+     *
+     * The bank is the slice of the collector's retained region into which each
+     * producer copies its settled record totals at its last flush, so those
+     * totals survive the next run's counter reset. Indexed by the run's actual
+     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
+     * collector not initialized, slot out of range, or no run identity), which
+     * the device reads as "publish no snapshot".
+     *
+     * Diagnostic-only and never a prepare failure: a run with no bank simply
+     * reports no retained snapshot, and the existing reconcile remains the
+     * authoritative accounting either way.
+     */
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+
+    /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
      * the cached `max_block_dim_`. A run is never narrower than the
      * device — orchestration sizes its cohorts from
@@ -1146,14 +1317,6 @@ protected:
      * when the prepared Runtime is launched.
      */
     int resolve_block_dim();
-
-    /**
-     * Rewrites each task's `function_bin_addr` from
-     * `runtime.get_function_bin_addr(func_id) +
-     * CoreCallable::binary_data_offset()`. Runs during enqueue, after the
-     * bind that populates the task table.
-     */
-    void resolve_task_binary_addrs(Runtime &runtime);
 
     /**
      * Wait for an explicit AICPU/AICore stream pair (AICPU first) with the
@@ -1234,6 +1397,32 @@ protected:
     void retire_run_fence(const PreparedExecution &prepared) noexcept;
 
     /**
+     * Take this runner's reference on the process's exception-notification
+     * callback, once. Idempotent: the slot is process-global and refcounted
+     * elsewhere, so a runner holds at most one reference no matter how often
+     * its device bring-up runs.
+     */
+    int acquire_device_fault_monitor();
+
+    /** Drop it. A no-op for a runner that never took one. */
+    void release_device_fault_monitor() noexcept;
+
+    /**
+     * Retire this runner's per-generation fault evidence after a **confirmed**
+     * device reset, and re-register the callback if this runner holds the monitor.
+     *
+     * Named for the retirement because that is the part this always does. A
+     * runner whose `acquire` failed still runs work and still accumulates a
+     * generation's stream ids, so the reset has to invalidate them whether or not
+     * a callback was ever installed — the monitor's own fence is the conditional
+     * half. Whether a registration survives a force reset is unmeasured, so it is
+     * remade rather than assumed either way; registering twice is harmless.
+     *
+     * Returns the monitor's re-install rc, or 0 when no monitor is held.
+     */
+    int retire_device_generation_after_confirmed_reset() noexcept;
+
+    /**
      * Read and reduce this slot's device-phase/task-timing records after stream
      * sync, into that slot's `DeviceRunTiming`. A D2H failure is a soft warning
      * and leaves the record zeroed, as do a capture-disabled run, a missing
@@ -1249,7 +1438,7 @@ protected:
      * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
      * KernelArgs.
      *
-     * @return 0 on success, the underlying init_runtime_args rc on failure.
+     * @return 0 on success, the underlying prepare/publish rc on failure.
      */
     int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot);
 
@@ -1287,9 +1476,13 @@ protected:
      * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
      * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
      * calling this helper. The sim base carries the same split.
+     *
+     * `run_epoch` identifies the run whose retained terminal snapshot is read
+     * back, which happens only when `device_execution_complete` says the caller
+     * observed this run's completion fence.
      */
     void teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     );
 
     /**
@@ -1408,6 +1601,7 @@ protected:
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
+    void release_run_image_stagings();
 
     /**
      * Drop the retained graph-definition blocks without freeing the device side.
@@ -1634,6 +1828,16 @@ protected:
     };
     std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
 
+    // Host staging for the device execution image, one retained buffer per
+    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
+    // and the same grow-only retention as the mirror above; what differs is
+    // what it holds and how long it has to hold it. A bind assembles the
+    // bytes here and records where they go; the publication reads them
+    // afterwards, so this buffer is what makes the source outlive the
+    // preparation. Sized to the image a bind ships rather than to the
+    // mirror's capacity.
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
+
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
     // preparing one bank never mutates a region the active run is executing
@@ -1671,6 +1875,42 @@ protected:
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
     std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+
+    // Whether this runner holds a reference on the process's fault-notification
+    // callback, which process took it, and where this runner has read up to.
+    // The read position is per runner rather than per run because the
+    // notification carries nothing that could place it on a run.
+    //
+    // The pid is what a fork makes necessary. The monitor resets itself in the
+    // child, so a runner that carried an inherited `held` across the fork would
+    // never reacquire — no callback installed for the child, and a read
+    // position sitting past the child's freshly zeroed stream, which reports
+    // nothing for the rest of that process's life. Every entry point therefore
+    // goes through `fault_monitor_if_held()`.
+    bool fault_monitor_held_{false};
+    long fault_monitor_pid_{-1};
+    DeviceFaultNoticeCursor fault_notices_;
+    // What the fault channel has said about *this* device, per generation. Its
+    // suspicion is one of the two refusals `accepts_new_run` composes; the other
+    // is each arch's `device_unusable_`, which `recover_device_or_mark_unusable`
+    // sets. The two clear by different routes, and only a confirmed reset retires
+    // this one.
+    DeviceHealthState device_health_;
+    // Driver ids of the streams this device's runs were launched on, captured at
+    // boundary-record time. The fault filter reads these rather than asking a
+    // handle: it runs at teardown, where a force reset may already have
+    // invalidated the handles, and a stream a run used may since have been
+    // replaced. Retired with the generation.
+    RunStreamIdentities run_stream_ids_;
+
+    /**
+     * The process monitor this runner holds a reference on, or `nullptr`.
+     *
+     * Answers `nullptr` for a reference inherited across a fork, and drops the
+     * inherited bookkeeping on the way out so the next `acquire` takes a real
+     * reference for this process.
+     */
+    DeviceFaultMonitor *fault_monitor_if_held() noexcept;
 
 public:
     /** The persistent device blocks belonging to one pipeline slot. */
@@ -1743,6 +1983,27 @@ protected:
     // clear, so a run whose reset failed does not publish the storage's
     // previous contents as its own timing.
     std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_timing_armed_{};
+    // One result region per pipeline slot: the device address handed to that
+    // slot's runs, and the host's copy of what the last such run published. Not
+    // gated on diagnostics — an error result must survive with capture off.
+    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
+    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    // Which run each cached copy was read for, and what that read left behind.
+    // Together they make the read once-per-run and keep the three read states
+    // apart: an empty copy read successfully is an absent record, an empty copy
+    // left by a failed D2H is no observation at all, and a slot with no region
+    // attempted no copy to lose.
+    RunRecordReadLedgerT<PTO_PIPELINE_MAX_DEPTH> device_run_result_reads_;
+    // The boundary completion each run's own drain or poll observed, retained
+    // because the drain's cleanup retires the fence that could otherwise be
+    // asked. See host/run_evidence_retention.h.
+    RunBoundaryLedgerT<PTO_PIPELINE_MAX_DEPTH> run_boundaries_observed_;
+    // Whether a slot's region has had `published` zeroed since it was
+    // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
+    // whatever the device left there — which cannot be assumed to differ from
+    // the epoch of the run about to use it. Steady-state reuse needs no clear
+    // because epochs distinguish runs, but the first use of an allocation does.
+    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_initialized_{};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

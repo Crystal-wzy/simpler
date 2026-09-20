@@ -33,7 +33,6 @@ Runtime::Runtime() {
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
-    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
@@ -98,6 +97,10 @@ void Runtime::clear_function_bin_addrs() {
     }
 }
 
-// trb's device image is just the `dev` descriptor (the rest of Runtime is
-// host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+// trb uploads the `dev` descriptor without its gate tail (the rest of Runtime is
+// host-only). The AICPU zeroes the active gates and executes wmb() before
+// publishing hs_setup_done_, and no register window opens before that, so no
+// host-supplied gate value is ever consumed. The allocation still covers the tail.
+size_t runtime_device_copy_size(const Runtime &) { return offsetof(DeviceRuntimeLaunchDesc, teardown_gates); }
+
+size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

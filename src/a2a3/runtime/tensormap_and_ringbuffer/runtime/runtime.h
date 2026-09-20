@@ -52,13 +52,9 @@
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES  // 24 AIC + 48 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
-
-// Default ready queue shards: one shard per worker thread (total minus orchestrator)
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -114,18 +110,6 @@ struct Handshake {
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 
-/**
- * Task structure - Compatibility stub for platform layer
- *
- * RT2 uses DispatchPayload instead of Task for task dispatch.
- * This stub exists only for API compatibility with device_runner.cpp.
- * Since get_task_count() returns 0, this struct is never actually used.
- */
-struct Task {
-    int func_id;
-    uint64_t function_bin_addr;
-};
-
 // =============================================================================
 // Device launch descriptor
 // =============================================================================
@@ -133,11 +117,13 @@ struct Task {
 /**
  * DeviceRuntimeLaunchDesc - the device-copied half of Runtime.
  *
- * This is the ONLY part of Runtime that crosses the host->device boundary: the
- * host fills it, `device_runner_helpers.cpp` rtMemcpy's exactly
- * `sizeof(DeviceRuntimeLaunchDesc)` bytes from offset 0 of the Runtime image,
- * and the AICPU/AICore read these fields back. It is the first member of
- * Runtime (offsetof == 0), so the narrowed copy needs no offset arithmetic.
+ * This is the ONLY part of Runtime that reaches device memory: the host fills it,
+ * `device_runner_helpers.cpp` allocates `sizeof(DeviceRuntimeLaunchDesc)` bytes
+ * for it and rtMemcpy's the uploaded prefix — `runtime_device_copy_size`, which
+ * stops before the device-initialized `teardown_gates` tail — from offset 0 of
+ * the Runtime image, and the AICPU/AICore read these fields back. It is the first
+ * member of Runtime (offsetof == 0), so the narrowed copy needs no offset
+ * arithmetic.
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
@@ -149,13 +135,7 @@ struct Task {
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    // Post-close return gates, one isolated cache line per worker. The AICPU
-    // stores here only after that worker's register window is closed; the
-    // AICore bypass-loads its own entry and returns once it reads RELEASE.
-    // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it.
-    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
-    int worker_count;  // Number of active workers
+    int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -164,7 +144,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -197,6 +176,20 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+
+    // Post-close return gates, one isolated cache line per worker. The AICPU
+    // stores here only after that worker's register window is closed; the
+    // AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it.
+    //
+    // Last, and outside the uploaded prefix: the AICPU zeroes every active entry
+    // in `pre_handshake_init` and executes `wmb()` before it publishes
+    // `hs_setup_done_`, and no register window opens before that publication. So
+    // the meaningful initial value is produced on the device ahead of every read
+    // of it, and no host-supplied gate value is consumed. The allocation still
+    // covers this array.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
 // =============================================================================
@@ -239,6 +232,7 @@ public:
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
+    const Handshake *get_workers() const { return dev.workers; }
     AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
@@ -299,23 +293,13 @@ public:
     void clear_function_bin_addrs();
 
     // =========================================================================
-    // Deprecated API (for platform compatibility, always returns 0/nullptr)
-    // Task graph is now managed by RuntimeContext, not Runtime
-    // =========================================================================
-
-    /** @deprecated Task count is now in shared memory */
-    int get_task_count() const { return 0; }
-
-    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
-    Task *get_task(int) { return nullptr; }
-
-    // =========================================================================
     // Host-only state (not copied to device)
     // =========================================================================
 
-    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time, then iterated in
-    // validate_runtime_impl. Host-only (after `dev`): never uploaded.
+    // Host-side tensor ledger for the run's H2D and D2H transfers. Populated by
+    // runtime_maker.cpp from orch_args at bind time, iterated by
+    // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
+    // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
 };
 
@@ -344,10 +328,25 @@ static_assert(
     "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
     "stays cache-line aligned"
 );
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
+    "teardown_gates must start on a cache line: the AICore flushes a whole Handshake line and a gate "
+    "sharing one would be overwritten"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
+        sizeof(DeviceRuntimeLaunchDesc),
+    "teardown_gates must end the descriptor: a field appended behind it would sit outside the uploaded "
+    "prefix and never receive its host value"
+);
 
-// Number of bytes of the Runtime image that must be copied to the device.
-// trb returns sizeof(DeviceRuntimeLaunchDesc) (only `dev` is device-read);
-// host_build_graph returns sizeof(Runtime) (its device image is the whole
-// object). Defined per-runtime so the shared device_runner_helpers.cpp copy
-// path stays runtime-agnostic.
+// Bytes of the Runtime image the host uploads. Defined per-runtime so the shared
+// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
+// runtime-agnostic. This runtime stops before the device-initialized gate tail.
 size_t runtime_device_copy_size(const Runtime &rt);
+
+// Bytes of device memory a Runtime image occupies. Never smaller than
+// `runtime_device_copy_size`, and the size every allocation backing a device
+// `Runtime` must use: the device addresses gates inside the tail this exceeds
+// the uploaded prefix by.
+size_t runtime_device_extent_size(const Runtime &rt);

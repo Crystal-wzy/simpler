@@ -23,7 +23,7 @@ Two host behaviours are exercised, because they genuinely differ:
   wins the race and masks the real code with a generic CANN ``507xxx``; the
   device-classified info (orchestrator code, the #1180 ``sub_class`` for the
   scheduler stall, or the async ``sched_error_code``) still reaches the host via
-  the ``validate_runtime_impl`` log line. That race is the exact scenario #1180
+  the ``copy_back_run_outputs_impl`` log line. That race is the exact scenario #1180
   exists for and only hardware reproduces it; the onboard test therefore asserts
   on the host log rather than the masked exception code.
 """
@@ -84,7 +84,7 @@ def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, tim
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
 #   runtime_env: CallConfig.runtime_env overrides that pin the offending resource small
 #   kernel     : AIV kernel (rel to kernels/) for the async cases, else None
-#   marker     : substring of the validate_runtime_impl host-log line proving the
+#   marker     : substring of the copy_back_run_outputs_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
 #   explain    : SIMPLER_ERROR_* name the "error detail:" annotation line must carry, so
@@ -362,7 +362,8 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.parametrize("case_name", list(CASES))
 def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
-    configure_logging("error")
+    # warning, not error: the run-result fallback asserted below is a LOG_WARN.
+    configure_logging("warning")
     case = CASES[case_name]
     dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
@@ -378,6 +379,14 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
             dropped_before,
         )
         _assert_annotated(log, case)
+        # The detail must come from the result the run's own device side
+        # published, not from the shared header a successor may already have
+        # reset. The runtime warns whenever it falls back to that header, and
+        # that warning is a real discriminator: disabling the device-side
+        # publish makes it fire on every case here.
+        assert "read from the shared header" not in log, (
+            "the failure detail came from the shared header, so this run published no result"
+        )
     finally:
         worker.close()
 

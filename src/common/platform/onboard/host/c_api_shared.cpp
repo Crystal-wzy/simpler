@@ -33,6 +33,7 @@
 #include "host/kernel_pipeline_contract.h"
 #include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
+#include "run_retention_probe.h"
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -102,7 +103,49 @@ extern "C" {
  * Runtime Implementation Functions (defined in each runtime's runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+/**
+ * Perform the device write a run's bind prepared.
+ *
+ * The bind computes its device execution image into staging that outlives it and
+ * records where the bytes go; this ships them. Two steps rather than one, so the
+ * write can be ordered against something — or captured and replayed — without
+ * the host graph building that produced the bytes having to run again. Consumes
+ * the record: publishing twice, or publishing a bind that recorded nothing, is an
+ * error, because a run whose image never reached the device must not launch. A
+ * runtime whose bind writes its own image where it builds it implements this as a
+ * no-op.
+ */
+int publish_run_image_impl(Runtime *runtime, const HostApi *api);
+/**
+ * One run's input staging: copy each input-bearing binding's current host bytes
+ * into the device buffer the bind gave it.
+ *
+ * Separate from the bind because the bind settles which device buffer each
+ * caller tensor uses, not what is in it. This adapter calls it from
+ * `simpler_prepare_run`, after the bind. A runtime whose host orchestrator reads
+ * the inputs while it builds the graph stages them inside its own bind and
+ * implements this as a no-op.
+ */
+int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+/**
+ * One run's result inspection: read the device-side runtime status when it
+ * failed on the device, then copy every written tensor back to the caller's
+ * buffers.
+ *
+ * Releases nothing, so that reading a run's results and retiring the device
+ * memory behind them are separately orderable — which is what a partially
+ * submitted run needs, where the results are readable but the bindings must be
+ * retained until quiescence is proven. `launched` distinguishes a run that
+ * reached a stream, and whose device-side status is therefore readable, from one
+ * that never did; it is an argument rather than an inference from the image so
+ * that a failing prepare does not have to mutate what it was about to publish.
+ */
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+/**
+ * End the tensor bindings the bind recorded, releasing each the way its
+ * provenance requires.
+ */
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
 __attribute__((weak)) int prepared_run_config_compatible_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
@@ -237,6 +280,18 @@ acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t
     }
 }
 
+static int
+acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)
+            ->acquire_run_image_staging(pipeline_slot, bytes, alignment, addr_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
     if (runner_ctx == nullptr) return 0;
     try {
@@ -339,6 +394,17 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
     } catch (...) {}
 }
 
+static const void *get_run_result(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) {
+    if (bytes_out != nullptr) *bytes_out = 0;
+    if (runner_ctx == nullptr) return nullptr;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->device_run_result(pipeline_slot, run_epoch, bytes_out);
+    } catch (...) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+}
+
 // Weak no-op default lives in device_runner_base.cpp; tensormap_and_ringbuffer
 // links a strong override that builds + caches the prebuilt runtime-arena.
 // simpler_init calls it directly for the fork-constant ring sizing.
@@ -362,6 +428,7 @@ static const HostApiOps g_host_api_ops = {
     .acquire_graph_definition_block = acquire_graph_definition_block,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_sm_mirror = acquire_sm_mirror,
+    .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
@@ -373,6 +440,7 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    .get_run_result = get_run_result,
 };
 
 /* ===========================================================================
@@ -540,7 +608,7 @@ int simpler_init(
     // sizing is read.
     if (prewarm_config != NULL) {
         try {
-            const HostApi prewarm_api(runner, 0, 0, &g_host_api_ops);
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
                 prewarm_config->runtime_env.ring_dep_pool
@@ -575,7 +643,7 @@ static int record_callable_on_runner(
             runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
         }
     });
-    const HostApi host_api(runner, 0, 0, &g_host_api_ops);
+    const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
     int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
     if (rc != 0) return rc;
 
@@ -775,19 +843,83 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) {
     return ctx != nullptr && concurrent_native_prepare_supported_impl() != 0 ? 1 : 0;
 }
 
-static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc, bool clear_gm_sm) {
+/**
+ * Assemble what both of this run's evidence channels observed, without asking
+ * the device anything.
+ *
+ * The boundary half is the observation the run's own drain or poll retained,
+ * not a fresh poll: by the time this runs, that drain's cleanup has retired the
+ * fence's arming, so a poll would answer `Error` about the fence rather than
+ * about the run. The record half is the cached copy `read_device_run_result`
+ * already took, with its read status, so a failed copy stays distinguishable
+ * from a read never attempted. Neither half asks the device anything.
+ */
+static RunOutcomeEvidence collect_run_evidence(const OnboardNativeRunContext *state) {
+    RunOutcomeEvidence evidence;
+    evidence.boundaries = state->runner->observed_run_boundaries(state->identity());
+    evidence.record_read =
+        state->runner->device_run_result_read_status(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    evidence.terminal =
+        state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    return evidence;
+}
+
+/**
+ * Compare what the shared decision rule makes of this run against the channel
+ * that still decides it — the stream synchronize behind `execution_rc`.
+ *
+ * The rule is `decide_run_execution`, the same one a promotion would put in
+ * charge; running it here is what produces the evidence that it agrees. It
+ * reports and never overrides: `execution_rc` is unchanged by this function and
+ * by everything it calls. A run the rule cannot decide is not a disagreement —
+ * the producers that publish nothing on a path are exactly what the audit is
+ * for, and the reason names which path it was.
+ */
+static void report_terminal_disagreement(const OnboardNativeRunContext *state, int execution_rc) {
+    const RunExecutionOutcome outcome = decide_run_execution(collect_run_evidence(state));
+    switch (outcome.state) {
+    case RunExecutionState::Succeeded:
+        if (execution_rc != 0) {
+            LOG_ERROR(
+                "run terminal disagreement: the record decides success, execution reported %d (%s)", execution_rc,
+                state->trace_attrs
+            );
+        }
+        break;
+    case RunExecutionState::Failed:
+        if (execution_rc == 0) {
+            LOG_ERROR(
+                "run terminal disagreement: the record decides failure code %d (source %u), execution reported "
+                "success (%s)",
+                outcome.code, static_cast<unsigned>(outcome.source), state->trace_attrs
+            );
+        }
+        break;
+    case RunExecutionState::Pending:
+    case RunExecutionState::Undecided:
+        LOG_INFO(
+            "run outcome %s: %s; execution reported %d (%s)", run_execution_state_name(outcome.state),
+            outcome.reason != nullptr ? outcome.reason : "no reason given", execution_rc, state->trace_attrs
+        );
+        break;
+    }
+}
+
+static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
-    if (clear_gm_sm) state->runtime.set_gm_sm_ptr(nullptr);
     state->runner->finish_clock_correlation_session(
         state->descriptor.pipeline_slot, false, !state->runner->can_accept_run()
     );
+    // A prepare that failed produced no device work, so there is no status to
+    // read and nothing written to copy back. Whatever bindings its bind got as
+    // far as recording are this attempt's, and end with it.
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        validation_rc = validate_runtime_impl(&state->runtime, &state->host_api, execution_rc);
+        validation_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
     } catch (...) {
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -845,7 +977,7 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (!runner->can_accept_run()) {
+    if (!runner->accepts_new_run()) {
         LOG_ERROR("simpler_prepare_run: runner is unusable after a prior device failure");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -889,7 +1021,7 @@ int simpler_prepare_run(
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         int rc = runner->attach_current_thread(runner->device_id());
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         if (overlaps_active_run) {
             // The probe exists to protect a *shared* arena bank, so require it
@@ -931,16 +1063,16 @@ int simpler_prepare_run(
                         state->trace_attrs
                     );
                 }
-                return cleanup_failed_prepare(state, compatibility_rc, true);
+                return cleanup_failed_prepare(state, compatibility_rc);
             }
         }
 
         state->runner_resources_owned = true;
         rc = runner->provision_native_run_resources(state->descriptor.pipeline_slot);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         rc = runner->prepare_launch_shape(state->runtime, state->config);
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
 
         // Latches what a device-context query answers from. Skipped for a
         // successor prepared against an active predecessor, whose configuration
@@ -965,17 +1097,42 @@ int simpler_prepare_run(
                 state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The bind prepared this run's device image into staging the slot owns;
+        // this publishes it, before anything else touches the device arena. Two
+        // calls rather than one because the write is orderable on its own: the
+        // bytes are ready when the bind returns, and shipping them is this
+        // caller's decision.
+        {
+            STRACE("chip.run.publish_image");
+            rc = publish_run_image_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
         emit_host_dep_gen_graph(state->config, state->trace_attrs);
-        rc = runner->prepare_execution(
-            state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
-            &state->prepared_execution
-        );
-        if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        // This run's own input bytes, into the buffers its bind just named.
+        {
+            STRACE("chip.run.stage_inputs");
+            rc = copy_in_run_inputs_impl(&state->runtime, &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
+        {
+            STRACE("chip.run.prepare_execution");
+            rc = runner->prepare_execution(
+                state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
+                &state->prepared_execution
+            );
+        }
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
         state->runner_resources_owned = false;
         return 0;
     } catch (...) {
-        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL, true);
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
@@ -1000,7 +1157,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
     }
-    if (!state->runner->can_accept_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr ||
         !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
         LOG_ERROR("simpler_launch_run: execution claim is occupied (%s)", state->trace_attrs);
@@ -1008,8 +1165,9 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     }
     state->runner_claimed = true;
     // The active predecessor may poison the device after this successor was
-    // prepared but before the execution claim becomes available.
-    if (!state->runner->can_accept_run()) {
+    // prepared but before the execution claim becomes available, and the fault
+    // channel may have matched a notice to this device in the same window.
+    if (!state->runner->accepts_new_run()) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1090,6 +1248,87 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return state->completion_rc;
 }
 
+/**
+ * #2267's late-read retention fixture. See run_retention_probe.h for what it
+ * replaces and why production cannot produce the state it measures.
+ *
+ * This entry only resolves and validates the two runs; the sequence itself
+ * lives beside the peer. On return the predecessor is still Running and the
+ * successor is Complete, so the caller finalizes each exactly as it would after
+ * an ordinary wait — the predecessor's drain, its DFX teardown and its
+ * copy-back are all the production path, reached from the phase it is left in.
+ */
+int simpler_probe_run_retention(
+    DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle runtime_successor,
+    const RunRetentionProbeConfig *config, RunRetentionProbeReport *report
+) {
+    if (config == nullptr || report == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_probe_run_retention");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || state->active_execution == nullptr) {
+        LOG_ERROR("simpler_probe_run_retention: the predecessor must be launched and still own device work");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    OnboardNativeRunContext *successor = nullptr;
+    if (config->launch_successor != 0) {
+        successor = native_run_context(ctx, runtime_successor, "simpler_probe_run_retention");
+        if (successor == nullptr || successor == state) {
+            LOG_ERROR("simpler_probe_run_retention: the successor must be a second prepared run");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (successor->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+            successor->prepared_execution == nullptr) {
+            LOG_ERROR("simpler_probe_run_retention: the successor must be prepared and not launched");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) {
+        LOG_ERROR("simpler_probe_run_retention: attach_current_thread failed: %d", rc);
+        return rc;
+    }
+
+    std::unique_ptr<DeviceRunnerBase::ActiveExecution> active_successor;
+    std::unique_ptr<DeviceRunnerBase::PreparedExecution> no_successor;
+    // Passed as an lvalue so a successor the fixture never consumes — a refused
+    // arm, or a launch that did not reach the device — comes back still owned by
+    // its own context, which is what will release it.
+    std::unique_ptr<DeviceRunnerBase::PreparedExecution> &successor_prepared =
+        successor != nullptr ? successor->prepared_execution : no_successor;
+    try {
+        rc = run_retention_probe(
+            *state->runner, *state->active_execution, successor_prepared, *config, report, &active_successor
+        );
+    } catch (...) {
+        LOG_ERROR("simpler_probe_run_retention: the sequence threw");
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    if (successor != nullptr) {
+        successor->active_execution = std::move(active_successor);
+        if (successor->active_execution != nullptr) {
+            // The fixture drained it, so it reaches finalize in the same phase an
+            // ordinary wait would leave it in. Set outright rather than only over
+            // a zero: a context starts at -1 so a run that never completed cannot
+            // read as success, and the fixture performed this run's launch and
+            // drain, so it is what decides.
+            successor->completion_rc = report->successor_drain_rc;
+            successor->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+            emit_native_run_runner_wall(successor);
+        }
+        // Otherwise it never reached the device and is still Prepared, which is
+        // the state finalize already knows how to abort.
+    }
+    return rc;
+}
+
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
@@ -1110,8 +1349,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // that must be drained, whose rc is the run's result, and whose runtime
     // holds a live GM/SM pointer, from one that never touched a stream.
     const bool launched = state->active_execution != nullptr;
-    // Both drain_execution() and validate_runtime_impl() touch the device, so
-    // the attach covers each of them. rtSetDevice is idempotent on an
+    // Both drain_execution() and copy_back_run_outputs_impl() touch the device,
+    // so the attach covers each of them. rtSetDevice is idempotent on an
     // already-attached thread.
     int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
@@ -1140,13 +1379,43 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        if (!launched) state->runtime.set_gm_sm_ptr(nullptr);
         if (attach_rc == 0) {
+            // Immediately before the consumer, and after whichever drain
+            // completed the run — `simpler_wait_run` may have done it, leaving
+            // nothing for the catch-up drain above. Read on every launched run,
+            // not only the failing ones: the device now publishes a terminal
+            // record for a success too, and a channel only consulted after some
+            // other channel already decided can never replace that other
+            // channel. One read per run; finalize consumes this copy.
+            if (launched) {
+                state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                report_terminal_disagreement(state, execution_rc);
+                // A separate axis from this run's outcome: a notification names a
+                // device and a stream, carries no run identity, and can arrive
+                // late — 16 s is the longest lag measured, not a bound the SDK
+                // promises — so it can name a fault from an earlier run than this
+                // one, and cannot say whether any run was impaired. `execution_rc`
+                // is settled above and is not read or written here; a matched
+                // notice refuses *future* admission and nothing else.
+                const uint64_t own_stream_faults = state->runner->consume_device_fault_notices();
+                if (own_stream_faults != 0) {
+                    LOG_WARN(
+                        "device fault channel matched %llu notice(s) to this runner's run streams while finalizing "
+                        "%s; this run's own outcome is unchanged and the device refuses further admission",
+                        static_cast<unsigned long long>(own_stream_faults), state->trace_attrs
+                    );
+                }
+            }
             {
                 STRACE("chip.run.validate");
-                validation_rc = validate_runtime_impl(
-                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL
+                validation_rc = copy_back_run_outputs_impl(
+                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                    launched ? 1 : 0
                 );
+                // This run is the only user of its bindings, so they end here,
+                // after its outputs have come back through them.
+                const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0) {
                 emit_device_phase_markers(state->runner, state->descriptor.pipeline_slot);

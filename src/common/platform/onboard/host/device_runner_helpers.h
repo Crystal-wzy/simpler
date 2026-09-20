@@ -34,6 +34,7 @@
 
 #include "common/kernel_args.h"  // arch-specific KernelArgs layout
 #include "host/memory_allocator.h"
+#include "host/runtime_launch_image.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
 
@@ -65,25 +66,31 @@ int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_str
 int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
- * The device blocks one pipeline slot reuses across every run it prepares.
+ * The device block one pipeline slot reuses across every run it prepares.
  *
- * Both have a size fixed for the runner's lifetime — `sizeof(KernelArgs)` and
- * the runtime variant's device-copy length — so a run rewrites their contents
- * rather than reallocating them. A slot admits at most one run at a time
+ * Its size is fixed for the runner's lifetime — the runtime variant's device
+ * extent — so a run rewrites its contents rather than reallocating it. That
+ * extent is never shorter than what a run uploads, and on a variant whose
+ * descriptor ends in device-initialized storage it is longer: that range lives
+ * inside the block but outside every copy into it. A slot admits at most one run
+ * at a time
  * (`try_reserve_native_run` rejects a second reservation on an occupied slot),
- * so one block per slot needs no further serialization.
+ * so one block per slot needs no further serialization. Per-slot rather than
+ * per-runner because the copy is not ordered on the run stream: a prepared
+ * successor would otherwise overwrite the image its predecessor is executing
+ * against.
  *
- * The runner owns these for its whole lifetime and releases them in
- * `finalize()`, alongside the collector resources that already work this way.
+ * The runner owns this for its whole lifetime and releases it in `finalize()`,
+ * alongside the collector resources that already work this way.
  *
  * The AICore register tables are deliberately NOT here: they are device
  * constants, identical for every slot, and are owned per device context by
- * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`.
+ * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`. Nor is a device copy of
+ * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
 struct SlotPersistentArgs {
-    Runtime *runtime_args{nullptr};      // device copy of the Runtime prefix
-    KernelArgs *device_k_args{nullptr};  // device copy of KernelArgs for AICore
-    uint64_t runtime_bytes{0};           // committed length of runtime_args
+    Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
+    uint64_t runtime_bytes{0};       // committed length: the full device extent, not the uploaded prefix
 };
 
 /**
@@ -111,34 +118,31 @@ struct KernelArgsHelper {
     KernelArgsHelper(KernelArgsHelper &&other) noexcept :
         args(other.args),
         allocator_(std::exchange(other.allocator_, nullptr)),
-        device_k_args_(std::exchange(other.device_k_args_, nullptr)) {
+        runtime_image_(std::move(other.runtime_image_)),
+        runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)) {
         other.args = KernelArgs{};
     }
     KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
 
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
-    KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
 
-    /**
-     * Publish the host runtime into the slot's device copy, committing that
-     * copy on first use.
-     *
-     * @param host_runtime  Host-side runtime to copy to device.
-     * @param allocator     Memory allocator to use.
-     * @param slot          The slot's persistent device blocks.
-     * @return 0 on success, error code on failure.
-     */
-    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
+    // Reserve the slot's destination and snapshot this invocation's device-read
+    // descriptor. An unpublished snapshot rejects another prepare without
+    // changing its source, destination, or allocator. After publication or
+    // release, a fresh prepare withdraws the previous publication status.
+    int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
 
-    /**
-     * Publish this run's `KernelArgs` into the slot's device copy, committing
-     * that copy on first use. AICore's `KERNEL_ENTRY` expects a `KernelArgs *`
-     * (not a `Runtime *`) so it can read the profiling enablement bits + ring
-     * address tables and forward them into AICore platform state. Call this
-     * after every `kernel_args.args.*` field is populated for the run.
-     */
-    int init_device_kernel_args(MemoryAllocator &allocator, SlotPersistentArgs &slot);
+    // Consume the snapshot with a synchronous metadata H2D. The slot remains
+    // owned even on failure. Callers must check the return code and abort the
+    // run on error. A repeated publish is rejected without another copy.
+    int publish_runtime_args();
+
+    // A non-null destination alone may still contain a previous run's bytes.
+    // This verdict covers only the Runtime descriptor, not late DFX publication.
+    bool runtime_args_published() const {
+        return runtime_args_state_ == RuntimeArgsState::Published && args.runtime_args != nullptr;
+    }
 
     /**
      * Drop this run's view of the slot's device blocks.
@@ -147,8 +151,9 @@ struct KernelArgsHelper {
      * the per-run `KernelArgs` stops naming them.
      */
     void release_run_view() {
+        runtime_image_.clear();
+        runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
-        device_k_args_ = nullptr;
     }
 
     /**
@@ -157,8 +162,7 @@ struct KernelArgsHelper {
      * Used only by fatal teardown after reset/quarantine.
      */
     void abandon_after_device_failure() {
-        args.runtime_args = nullptr;
-        device_k_args_ = nullptr;
+        release_run_view();
         allocator_ = nullptr;
     }
 
@@ -170,6 +174,12 @@ struct KernelArgsHelper {
      */
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }
+
+private:
+    enum class RuntimeArgsState : uint8_t { Empty, Prepared, Published };
+
+    RuntimeLaunchImage runtime_image_;
+    RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
 };
 
 /**
