@@ -26,15 +26,22 @@
 
 #include <algorithm>
 
-#include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
-#include "common/tensor_data_timeout.h"
 #include "common/unified_log.h"
+#include "spin_hint.h"  // PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS (platform-variant data-wait budget)
 #include "tensormap_and_ringbuffer/task_id.h"
 #if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
+
+// Weak fallback for HOST .so builds (never called, but satisfies linker).
+// The AICPU build links the strong symbol from platform/.../device_time.cpp.
+// Hidden visibility prevents HOST .so from polluting global symbol table.
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
+
+static constexpr uint64_t TENSOR_DATA_TIMEOUT_CYCLES =
+    static_cast<uint64_t>(PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
@@ -85,16 +92,13 @@ void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, c
 //   (consumer low bits of fanout_refcount >= consumer count, excluding the
 //    bit31 scope reference).
 // Uses cycle-based timeout (checked every 1024 spins).
-// Returns false on timeout or an observed fatal error (sets orch.fatal).
+// Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(
     RuntimeContext *rt, const simpler::tmr::Tensor &tensor, bool wait_for_consumers, const char *caller
 ) {
     TaskId owner = tensor.owner_task_id;
     OrchestratorState &orch = rt->orchestrator;
-    const int configured_ms = get_tensor_data_timeout_ms();
-    const uint64_t timeout_ms = configured_ms > 0 ? configured_ms : TENSOR_DATA_TIMEOUT_MS;
-    const uint64_t timeout_ticks = timeout_ms * PLATFORM_PROF_SYS_CNT_FREQ / 1000;
 
     // Segmented wait: collect up to kSegmentCap producer slots, then flush by
     // spinning on each. When the segment fills, we wait for the accumulated
@@ -111,26 +115,20 @@ static bool wait_for_tensor_ready(
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = static_cast<int32_t>(slot.task->task_id.local_id());
         uint64_t t0 = get_sys_cnt_aicpu();
-        uint32_t spin_count = 0;
+        int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < CHIP_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
-                const uint64_t elapsed_ticks = get_sys_cnt_aicpu() - t0;
-                // A failed scheduler cannot complete this dependency. Preserve its error.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE ||
-                    orch.sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
-                    orch.fatal = true;
+                // A fatal latched elsewhere breaks this wait; cold path only.
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
                     failed = true;
                     return;
                 }
-                if (elapsed_ticks > timeout_ticks) {
+                if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (budget_ms=%llu, elapsed_ms=%llu): producer (ring=%d, local=%d, "
-                        "state=%d) not completed",
-                        (unsigned long long)(timeout_ticks * 1000 / PLATFORM_PROF_SYS_CNT_FREQ),
-                        (unsigned long long)(elapsed_ticks * 1000 / PLATFORM_PROF_SYS_CNT_FREQ), ring_id, local_id,
-                        slot.task_state.load(std::memory_order_acquire)
+                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                     );
                     failed = true;
                     return;
@@ -143,28 +141,21 @@ static bool wait_for_tensor_ready(
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = slot.task->task_id.local_id();
         uint64_t t0 = get_sys_cnt_aicpu();
-        uint32_t spin_count = 0;
+        int32_t spin_count = 0;
         while ((slot.fanout_refcount.load(std::memory_order_acquire) & ~FANOUT_SCOPE_BIT) <
                (slot.fanout_count & ~FANOUT_SCOPE_BIT)) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
-                const uint64_t elapsed_ticks = get_sys_cnt_aicpu() - t0;
-                // A failed scheduler cannot complete this dependency. Preserve its error.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE ||
-                    orch.sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
-                    orch.fatal = true;
+                // A fatal latched elsewhere breaks this wait; cold path only.
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
                     failed = true;
                     return;
                 }
-                if (elapsed_ticks > timeout_ticks) {
+                if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (budget_ms=%llu, elapsed_ms=%llu): consumers of producer (ring=%d, "
-                        "local=%d) not done (released=%u, expected=%u)",
-                        (unsigned long long)(timeout_ticks * 1000 / PLATFORM_PROF_SYS_CNT_FREQ),
-                        (unsigned long long)(elapsed_ticks * 1000 / PLATFORM_PROF_SYS_CNT_FREQ), ring_id, local_id,
-                        slot.fanout_refcount.load(std::memory_order_acquire) & ~FANOUT_SCOPE_BIT,
-                        slot.fanout_count & ~FANOUT_SCOPE_BIT
+                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                     );
                     failed = true;
                     return;

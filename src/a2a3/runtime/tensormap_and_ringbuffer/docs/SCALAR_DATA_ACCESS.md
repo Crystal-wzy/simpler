@@ -28,53 +28,28 @@ Both call into the runtime through the ops table — orchestration .so needs no 
 ### 3.1 get_tensor_data Flow
 
 ```text
-addr null-check → collect owner and overlapping writers → wait for each producer → compute offset → memcpy read
+addr null-check → TensorMap lookup → spin-wait producer COMPLETED → compute flat offset → memcpy read
 ```
 
 - **addr null-check**: `buffer.addr == 0` means unallocated — log error, return 0
-- **Producer collection**: use `owner_task_id` for the allocation owner, then
-  query TensorMap/OverlapMap for modifier writers overlapping the tensor view.
-  One tensor can therefore require waiting for multiple tasks.
-- **spin-wait**: wait until each tracked producer has
-  `task_state >= CHIP_TASK_COMPLETED`.
-- **No producer**: skip waiting only when there is neither a valid owner nor
-  an overlapping writer. An empty lookup alone does not skip the owner wait.
+- **TensorMap lookup**: find producer task by `buffer.addr`
+- **spin-wait**: wait until producer `task_state >= CHIP_TASK_COMPLETED`
+- **No producer** (lookup callback never fires): skip waiting, read immediately
 
 ### 3.2 set_tensor_data Flow
 
 ```text
-addr null-check → collect owner and overlapping writers → wait for each producer and its consumers → memcpy write
+addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
 ```
 
-For each tracked producer, wait for completion and then for its outstanding
-consumers before moving to the next producer. Consumer counts occupy the low
-bits; the scope reference is a flag, not a count of one:
-
-```cpp
-(fanout_refcount & ~FANOUT_SCOPE_BIT) >= (fanout_count & ~FANOUT_SCOPE_BIT)
-```
+One extra step versus get_tensor_data: wait for all consumers to finish (`fanout_refcount >= fanout_count - 1`, excluding the scope reference).
 
 ### 3.3 Timeout
 
-- Uses the platform system counter (`get_sys_cnt_aicpu()`), checked every 1024 spins.
-- Defaults: 30 s in CPU simulation, 15 s onboard. The Host accepts
-  `SIMPLER_TENSOR_DATA_TIMEOUT_MS` (1..2147483647 ms); invalid values warn and
-  retain the backend default. Zero does not disable the deadline.
-- The setting is latched at `Worker.init()`, via `InitArgs` onboard or the
-  resident AICPU SO setter in simulation. Each scalar-access call reads the
-  latched value once and converts it using `PLATFORM_PROF_SYS_CNT_FREQ`.
-- Each producer gets its own timer, covering its upstream dependency latency.
-  Writes start a separate timer for that producer's consumers. Unrelated
-  completions never renew either timer.
-- The scheduler watchdog has independent per-thread progress timers and checks
-  task ownership before reporting a stall. Other threads completing work do not
-  unconditionally renew every timer. At a scalar-wait polling checkpoint, an
-  observed orchestration/scheduler error aborts the wait while preserving the
-  recorded error code. Tensor expiry otherwise reports code 8.
-- Failure sets `orch.fatal`; reads return zero and writes leave the element
-  unchanged. Diagnostics show the budget, elapsed time and dependency identity.
-- See [local timeout configuration](../../../../../docs/troubleshooting/local-timeout-defaults.md)
-  for initialization, validation and the outer watchdog ordering.
+- Uses cycle counter (`get_sys_cnt_aicpu()`), checked every 1024 spins
+- Threshold: `TENSOR_DATA_TIMEOUT_CYCLES`, derived from the platform default
+  (15 s onboard, 30 s in simulation)
+- On timeout: sets `orch.fatal = true`, preventing further task submission
 
 ## 4. Seeding a Runtime-Created Output
 
@@ -82,8 +57,8 @@ bits; the scope reference is a flag, not a count of one:
 with whatever the heap block last held. Two ways to give it defined content:
 
 ```cpp
-// Orchestration-side write: alloc creates a hidden owner task that completes
-// inline. Before any consumers are submitted, the wait finishes immediately.
+// Orchestration-side write: alloc returns before any producer or consumer
+// exists, so set_tensor_data finds nothing to wait for and writes at once.
 // Suited to scalars and a handful of elements; each call writes one element.
 TensorCreateInfo ci(shapes, ndims, dtype);
 TaskOutputTensors outs = alloc_tensors(ci);
@@ -112,7 +87,7 @@ const ChipTensor &scalar_tensor = outs.get_ref(0);
 uint32_t idx[1] = {0};
 set_tensor_data(scalar_tensor, 1, idx, 77.0f);
 
-// Read back the seeded value; no kernel was submitted in this example.
+// Orchestration-side blocking read (waits for kernel completion)
 float val = get_tensor_data<float>(scalar_tensor, 1, idx);
 ```
 
@@ -132,7 +107,7 @@ Three actors:
 | - | ---------- | -------- | ------ | --------- | ----- |
 | 1 | Kernel write (OUTPUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
 | 2 | Kernel write (OUTPUT) | Orch Write | WAW | spin-wait producer COMPLETED | Yes |
-| 3 | Kernel read (INPUT) | Orch Write | WAR | spin-wait tracked producer fanout | **Requires a tracked producer; see below** |
+| 3 | Kernel read (INPUT) | Orch Write | WAR | spin-wait fanout_refcount | **Needs INOUT** |
 | 4 | Kernel read-write (INOUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
 | 5 | Kernel read-write (INOUT) | Orch Write | WAW+WAR | spin-wait producer + consumers | Yes |
 | 6 | Orch Write | Kernel read (INPUT) | RAW | blocking completes before next submit | Yes |
@@ -144,11 +119,7 @@ Three actors:
 
 **Scenario #3 is the only case requiring special attention**:
 
-TensorMap tracks writer tasks, not standalone INPUT readers. For an external
-tensor with no `owner_task_id` and no overlapping writer, an INPUT-only access
-provides no producer slot whose fanout the scalar write can wait on. The write
-can therefore race with a kernel still reading it. Runtime-created tensors also
-have an owner slot; an empty TensorMap lookup does not by itself imply this risk.
+TensorMap tracks only producers (OUTPUT/INOUT), not pure INPUT consumers. If a tensor is only registered via `add_input()`, TensorMap has no producer entry for it. `set_tensor_data`'s `wait_for_tensor_ready()` finds no matching producer (the lookup callback never fires) and returns immediately — but the kernel may still be reading → **WAR data race**.
 
 **Solution**: For tensors that may later be written via `set_tensor_data`, use `add_inout()` instead of `add_input()`. INOUT registers a producer entry in TensorMap, enabling `set_tensor_data` to track all consumers through `fanout_refcount`.
 

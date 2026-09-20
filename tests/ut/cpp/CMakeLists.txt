@@ -107,6 +107,31 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 
+# ---------------------------------------------------------------------------
+# Platform-variant selector checks (compile-time only, no test executable)
+#
+# spin_hint.h is the single point binding PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS
+# to one platform_config.h default per variant. Each object below compiles the
+# same static_assert against one {arch, variant} include path, so an alias
+# pointing at the wrong variant's default fails the UT build.
+# ---------------------------------------------------------------------------
+foreach(arch a2a3 a5)
+    foreach(variant onboard sim)
+        string(TOUPPER ${variant} variant_uc)
+        add_library(${arch}_${variant}_spin_selector_check OBJECT
+            ${CMAKE_SOURCE_DIR}/common/spin_hint_selector_check.cpp
+        )
+        target_compile_definitions(${arch}_${variant}_spin_selector_check PRIVATE
+            EXPECTED_TENSOR_DATA_WAIT_TIMEOUT_MS=PLATFORM_${variant_uc}_TENSOR_DATA_WAIT_TIMEOUT_MS
+        )
+        target_include_directories(${arch}_${variant}_spin_selector_check PRIVATE
+            ${CMAKE_SOURCE_DIR}/../../../src/${arch}/platform/include
+            ${CMAKE_SOURCE_DIR}/../../../src/common/platform/${variant}/aicpu
+            ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        )
+    endforeach()
+endforeach()
+
 function(add_a2a3_runtime_test name src)
     add_executable(${name} ${src} ${ARGN})
     target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
@@ -407,25 +432,6 @@ function(add_common_utils_test name src)
 endfunction()
 
 enable_testing()
-
-foreach(arch a2a3 a5)
-    set(wait_test test_${arch}_tensor_data_wait)
-    if(arch STREQUAL "a2a3")
-        add_a2a3_orchestrator_runtime_test(${wait_test} common/test_tensor_data_wait.cpp)
-        set(wait_runtime_dir ${A2A3_RUNTIME_DIR})
-    else()
-        add_a5_orchestrator_runtime_test(${wait_test} common/test_tensor_data_wait.cpp)
-        set(wait_runtime_dir ${A5_RUNTIME_DIR})
-    endif()
-    target_sources(${wait_test} PRIVATE
-        ${wait_runtime_dir}/runtime_core.cpp
-        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/aicpu_device_config.cpp
-    )
-    add_test(NAME ${wait_test}_onboard COMMAND ${wait_test} 15)
-    add_test(NAME ${wait_test}_default COMMAND ${wait_test} 0)
-    set_tests_properties(${wait_test} ${wait_test}_onboard ${wait_test}_default
-        PROPERTIES TIMEOUT 30 LABELS "no_hardware")
-endforeach()
 
 foreach(runtime tensormap_and_ringbuffer host_build_graph)
     set(retirement_test test_a2a3_${runtime}_retirement)

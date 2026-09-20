@@ -49,6 +49,11 @@
 #else
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
+// PLATFORM_PROF_SYS_CNT_FREQ must not become visible through this header:
+// orchestration TUs define it locally (examples/**/kernels/orchestration/),
+// and a duplicate definition is a hard error (#1189). spin_hint.h pulls in
+// platform_config.h, which is safe only because the __has_include guard is
+// false for orchestration builds -- no aicpu variant dir is on their path.
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
 #include "aicpu/device_time.h"

@@ -8,12 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef SIMPLER_COMMON_PLATFORM_INCLUDE_COMMON_TENSOR_DATA_TIMEOUT_H_
-#define SIMPLER_COMMON_PLATFORM_INCLUDE_COMMON_TENSOR_DATA_TIMEOUT_H_
 
-#include <cstdint>
+// Compiled once per {arch} x {variant} include path (see CMakeLists.txt), with
+// EXPECTED_TENSOR_DATA_WAIT_TIMEOUT_MS defined to that variant's own
+// platform_config.h default. An alias in spin_hint.h that points at the wrong
+// variant's default fails this build.
 
-constexpr int32_t TENSOR_DATA_TIMEOUT_MS = 15000;
-constexpr int32_t SIM_TENSOR_DATA_TIMEOUT_MS = 30000;
+#include "spin_hint.h"
 
-#endif  // SIMPLER_COMMON_PLATFORM_INCLUDE_COMMON_TENSOR_DATA_TIMEOUT_H_
+static_assert(
+    PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS == EXPECTED_TENSOR_DATA_WAIT_TIMEOUT_MS,
+    "spin_hint.h must alias PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS to its own platform variant's default"
+);
